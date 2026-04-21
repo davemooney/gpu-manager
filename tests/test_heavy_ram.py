@@ -1052,3 +1052,124 @@ class TestReleaseDispatcher:
         assert "lite" not in gm.preempted_state
         assert "lite" not in gm.preempted_since
         assert "lease-flag-off" not in gm.paused_by
+
+
+# ---------------------------------------------------------------------------
+# WP-102-05: boot sweep extension — heavy_ram post-crash recovery
+# ---------------------------------------------------------------------------
+
+
+import time  # noqa: E402
+
+
+class TestBootSweep:
+    @pytest.mark.asyncio
+    async def test_heavy_client_unhealthy_is_restarted(self, clean_state, monkeypatch, write_config):
+        calls = []
+
+        async def fake_shell(cmd, timeout):
+            calls.append(cmd)
+            return (0, "", "")
+
+        async def fake_health(url):
+            return False
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        monkeypatch.setattr(gm, "_check_health", fake_health)
+        write_config({"clients": {"vllm": {
+            "cpu_contention": True, "preemptible": True, "heavy_ram": True,
+            "start_command": "launch-vllm", "stop_command": "stop-vllm",
+            "unpause_command": "unpause-vllm",
+            "health_check": "http://x"
+        }}})
+        await gm.boot_time_unpause_sweep()
+        assert any("launch-vllm" in c for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_healthy_heavy_client_not_restarted(self, clean_state, monkeypatch, write_config):
+        calls = []
+
+        async def fake_shell(cmd, timeout):
+            calls.append(cmd)
+            return (0, "", "")
+
+        async def fake_health(url):
+            return True
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        monkeypatch.setattr(gm, "_check_health", fake_health)
+        write_config({"clients": {"vllm": {
+            "cpu_contention": True, "preemptible": True, "heavy_ram": True,
+            "start_command": "launch-vllm", "unpause_command": "unpause-vllm",
+            "health_check": "http://x"
+        }}})
+        await gm.boot_time_unpause_sweep()
+        assert not any("launch-vllm" in c for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_non_heavy_clients_not_touched(self, clean_state, monkeypatch, write_config):
+        """Plain cpu_contention client without heavy_ram: no start attempt
+        even if unhealthy. Sweep may still fire unpause_command, but must
+        NOT fire start_command for a non-heavy client."""
+        calls = []
+
+        async def fake_shell(cmd, timeout):
+            calls.append(cmd)
+            return (0, "", "")
+
+        async def fake_health(url):
+            return False
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        monkeypatch.setattr(gm, "_check_health", fake_health)
+        write_config({"clients": {"lite": {
+            "cpu_contention": True, "preemptible": True,
+            # NO heavy_ram flag
+            "start_command": "launch-lite",
+            "unpause_command": "unpause-lite",
+            "health_check": "http://x",
+        }}})
+        await gm.boot_time_unpause_sweep()
+        # Unpause fired (cpu_contention sweep path), but NOT start_command.
+        assert any("unpause-lite" in c for c in calls)
+        assert not any("launch-lite" in c for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# WP-102-06: /clients/{name}/state enrichment
+# ---------------------------------------------------------------------------
+
+
+class TestStateEndpoint:
+    def test_returns_403_from_non_loopback(self, clean_state):
+        from fastapi.testclient import TestClient
+        c = TestClient(gm.app)
+        resp = c.get("/clients/vllm/state")
+        assert resp.status_code == 403
+
+    def test_returns_stopped_when_preempted(self, loopback_client, clean_state, monkeypatch, write_config):
+        write_config({"clients": {"vllm": {"cpu_contention": True, "heavy_ram": True, "start_command": "x"}}})
+        gm.preempted_state["vllm"] = "stopped"
+        gm.preempted_since["vllm"] = time.time() - 30
+        resp = loopback_client.get("/clients/vllm/state")
+        assert resp.json()["state"] == "stopped"
+        assert resp.json()["since_seconds"] is not None
+
+    def test_returns_restarting(self, loopback_client, clean_state, write_config):
+        write_config({"clients": {"vllm": {"heavy_ram": True, "start_command": "x"}}})
+        gm.preempted_state["vllm"] = "restarting"
+        resp = loopback_client.get("/clients/vllm/state")
+        assert resp.json()["state"] == "restarting"
+
+    def test_blocker_leases_reflected(self, loopback_client, clean_state, write_config):
+        write_config({"clients": {"vllm": {}}})
+        gm.paused_by["lease-A"] = {"vllm"}
+        gm.paused_by["lease-B"] = {"vllm", "other"}
+        resp = loopback_client.get("/clients/vllm/state")
+        body = resp.json()
+        assert set(body["blocker_leases"]) == {"lease-A", "lease-B"}
+
+    def test_unknown_client_404(self, loopback_client, clean_state, write_config):
+        write_config({"clients": {"vllm": {}}})
+        resp = loopback_client.get("/clients/mystery/state")
+        assert resp.status_code == 404
