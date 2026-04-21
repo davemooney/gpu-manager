@@ -12,6 +12,11 @@
 #                     enforcement. Long-running baseline services (sglang, VLM,
 #                     forma-server, etc.) stay up between leases and rely on
 #                     pause/unpause or lifecycle signals instead of full stops.
+#   heavy_ram         bool (NEW) — when preempted, release the container's
+#                     RAM via stop_command instead of SIGSTOP-only pause.
+#                     Restart is coalesced via HEAVY_RAM_COALESCE_SECONDS
+#                     on release. Requires start_command to be set.
+#                     Orthogonal to keepalive (which gates watchdog behaviour).
 #   start_command     shell command to launch
 #   stop_command      shell command to fully stop
 #   pause_command     (NEW) shell command to pause without tearing down
@@ -33,6 +38,7 @@ clients:
     preemptible: true
     cpu_contention: true
     keepalive: true
+    heavy_ram: true
     start_command: "/home/aidin/sglang-launch.sh"
     stop_command: "docker stop sglang-llm; docker rm sglang-llm"
     pause_command: "docker pause sglang-llm"
@@ -50,6 +56,7 @@ clients:
     preemptible: true
     cpu_contention: true
     keepalive: true
+    heavy_ram: true
     start_command: "/home/aidin/sglang-vision-launch.sh"
     stop_command: "docker stop sglang-vision; docker rm sglang-vision"
     pause_command: "docker pause sglang-vision"
