@@ -638,11 +638,22 @@ async def unpause_or_restart_for_released_lease(lease_id: str, config: dict) -> 
 unpause_for_released_lease = unpause_or_restart_for_released_lease
 
 
-async def boot_time_unpause_sweep(config: dict) -> None:
+async def boot_time_unpause_sweep(config: Optional[dict] = None) -> None:
     """At manager startup, best-effort unpause every cpu_contention client so
     we recover from a crash that stranded containers paused. INFO on success,
-    WARN on failure. Each client is unpaused at most once per sweep."""
-    for name, cfg in config.get("clients", {}).items():
+    WARN on failure. Each client is unpaused at most once per sweep.
+
+    WP-102-05 extension: a second pass handles heavy_ram clients whose
+    previous lifecycle was cut short by a manager crash — if their
+    `health_check` reports unhealthy we fire `start_command` so the container
+    comes back up even though we never issued the stop in this manager
+    process.
+    """
+    if config is None:
+        config = load_config()
+    clients_cfg = config.get("clients", {})
+
+    for name, cfg in clients_cfg.items():
         if not cfg.get("cpu_contention"):
             continue
         unpause_cmd = cfg.get("unpause_command")
@@ -682,6 +693,35 @@ async def boot_time_unpause_sweep(config: dict) -> None:
                 reason=f"exception={e}",
                 lease_id=None,
             )
+
+    # WP-102-05: heavy_ram recovery. For any client with heavy_ram: true,
+    # if its health_check fails, issue start_command (the manager previously
+    # crashed mid-generate with the container stopped; we owe a restart).
+    for name, cfg in clients_cfg.items():
+        if not cfg.get("heavy_ram"):
+            continue
+        if cfg.get("_heavy_ram_invalid"):
+            continue
+        health = cfg.get("health_check")
+        if not health:
+            continue
+        try:
+            healthy = await _check_health(health)
+        except Exception:
+            healthy = False
+        if healthy:
+            continue  # nothing to do
+        start_cmd = cfg.get("start_command")
+        if not start_cmd:
+            continue
+        try:
+            rc, _, err = await _run_shell(start_cmd, timeout=30.0)
+            if rc == 0:
+                _log_preemption(action="boot_restart", client=name, reason="post-crash recovery", lease_id="")
+            else:
+                _log_preemption(action="boot_restart_failed", client=name, reason=f"rc={rc}", lease_id="")
+        except Exception as e:
+            _log_preemption(action="boot_restart_failed", client=name, reason=str(e)[:160], lease_id="")
 
 
 # ---------------------------------------------------------------------------
@@ -1599,50 +1639,76 @@ def _infer_container_name(client: str, cfg: dict) -> Optional[str]:
 
 
 @app.get("/clients/{name}/state")
-async def client_state(name: str):
-    """Return one of: running | paused | stopped | starting.
+async def client_state(name: str, request: Request):
+    """Return the manager's view of a client's state, enriched with
+    provenance for the compose panel and other operator tooling.
 
-    Primary source of truth: our internal pause ledger. If the client is in
-    the ledger → paused. Otherwise, if the client has docker-backed
-    pause/unpause commands, we fall through to `docker inspect` so the answer
-    stays truthful across manager restarts. Finally, fall back to the health
-    check + lease state."""
+    WP-102-06: rewritten to loopback-gate and surface:
+      - `state`: running | paused | stopped | restarting | starting | start_failed | unknown
+      - `since_seconds`: how long the client has been in its current
+        preempted state (None if not preempted)
+      - `blocker_leases`: lease_ids (real + synthetic lifecycle keys) that
+        are currently holding the client preempted
+      - `last_action` / `last_action_at`: most recent entry from
+        preemption_log for this client
+    """
+    client_host = request.client.host if request.client else None
+    if client_host not in ("127.0.0.1", "::1"):
+        raise HTTPException(403, "loopback only")
     config = load_config()
     cfg = config.get("clients", {}).get(name)
-    if not cfg:
-        raise HTTPException(404, f"Unknown client: {name}")
+    if cfg is None:
+        raise HTTPException(404, f"unknown client: {name}")
 
-    # Ledger check first — this is what WE know.
-    if _is_currently_paused(name):
-        return {"client": name, "state": "paused", "source": "ledger"}
+    # Derive state: preempted_state first, then docker inspect, then health check
+    state = preempted_state.get(name)
+    if state is None:
+        # Not in our ledger — check docker / health
+        pause_cmd = cfg.get("pause_command")
+        if pause_cmd and "docker pause" in pause_cmd:
+            container = pause_cmd.split("docker pause", 1)[1].strip().split()[0]
+            try:
+                rc, out, _ = await _run_shell(f"docker inspect {container} --format '{{{{.State.Status}}}}'", timeout=3.0)
+                if rc == 0:
+                    status = out.strip()
+                    if status == "paused":
+                        state = "paused"
+                    elif status == "running":
+                        state = "running"
+                    elif status in ("exited", "dead"):
+                        state = "stopped"
+            except Exception:
+                pass
+        if state is None:
+            health = cfg.get("health_check")
+            if health:
+                try:
+                    state = "running" if await _check_health(health) else "stopped"
+                except Exception:
+                    state = "unknown"
+            else:
+                state = "unknown"
 
-    # Docker inspect fallback for clients with pause commands.
-    container = _infer_container_name(name, cfg)
-    if container:
-        raw = await _docker_container_state(container)
-        if raw == "paused":
-            return {"client": name, "state": "paused", "source": "docker"}
-        if raw == "running":
-            return {"client": name, "state": "running", "source": "docker"}
-        if raw in ("exited", "dead", "created"):
-            return {"client": name, "state": "stopped", "source": "docker"}
-        if raw == "restarting":
-            return {"client": name, "state": "starting", "source": "docker"}
+    since_ts = preempted_since.get(name)
+    since_seconds = int(time.time() - since_ts) if since_ts else None
+    blocker_leases = [lid for lid, blockers in paused_by.items() if name in blockers]
 
-    # Last-resort: health check + lease state.
-    has_lease = any(l.client == name for l in active_leases.values())
-    health_url = cfg.get("health_check")
-    if health_url:
-        healthy = await _check_health(health_url)
-        if healthy:
-            return {"client": name, "state": "running", "source": "health"}
-        if has_lease:
-            return {"client": name, "state": "starting", "source": "health"}
-        return {"client": name, "state": "stopped", "source": "health"}
+    # Last action from preemption_log
+    last_action = None
+    last_action_at = None
+    for entry in reversed(list(preemption_log)):
+        if entry.get("client") == name:
+            last_action = entry.get("action")
+            last_action_at = entry.get("timestamp")
+            break
 
-    if is_service_active(name, config):
-        return {"client": name, "state": "running", "source": "systemd"}
-    return {"client": name, "state": "stopped", "source": "systemd"}
+    return {
+        "state": state,
+        "since_seconds": since_seconds,
+        "blocker_leases": blocker_leases,
+        "last_action": last_action,
+        "last_action_at": last_action_at,
+    }
 
 
 @app.post("/clients/{name}/pause")
