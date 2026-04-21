@@ -1,16 +1,56 @@
+# GPU Manager client registry
+#
+# Fields:
+#   service           systemd unit name (nullable if start/stop is a shell cmd)
+#   default_vram_mb   baseline VRAM budget in MiB
+#   priority          critical | high | normal | idle
+#   preemptible       bool — can this client be preempted by higher-priority leases?
+#   cpu_contention    bool (NEW) — client pins significant CPU; pause when a
+#                     priority >= normal lease is acquired, unpause on release.
+#                     Defaults to false when absent. Backwards-compatible.
+#   start_command     shell command to launch
+#   stop_command      shell command to fully stop
+#   pause_command     (NEW) shell command to pause without tearing down
+#   unpause_command   (NEW) shell command to resume a paused client
+#   health_check      HTTP URL returning 200 when healthy
+#   startup_seconds   max wait window for health to come up
+#   callback_url      webhook the manager POSTs to on preemption
+#   description       human-readable label
+#
+# NOTE: /home/aidin/sglang-vision-launch.sh is deployed on aidin (outside this
+# repo). Operator responsibility. Captures the exact `docker run` invocation
+# for sglang-vision (Qwen2.5-VL-7B-Instruct-AWQ on cuda:1, port 8002).
+
 clients:
   vllm:
     service: null
     default_vram_mb: 29000
     priority: idle
     preemptible: true
+    cpu_contention: true
     start_command: "/home/aidin/sglang-launch.sh"
     stop_command: "docker stop sglang-llm; docker rm sglang-llm"
+    pause_command: "docker pause sglang-llm"
+    unpause_command: "docker unpause sglang-llm"
     health_check: "http://localhost:8001/v1/models"
     startup_seconds: 180
     model_env_file: "/home/aidin/.config/vllm/model.env"
     model_env_var: "VLLM_MODEL"
     description: "SGLang LLM inference (Docker, Blackwell)"
+
+  sglang-vision:
+    service: null
+    default_vram_mb: 16000
+    priority: idle
+    preemptible: true
+    cpu_contention: true
+    start_command: "/home/aidin/sglang-vision-launch.sh"
+    stop_command: "docker stop sglang-vision; docker rm sglang-vision"
+    pause_command: "docker pause sglang-vision"
+    unpause_command: "docker unpause sglang-vision"
+    health_check: "http://localhost:8002/v1/models"
+    startup_seconds: 180
+    description: "SGLang Vision (Qwen2.5-VL-7B-Instruct-AWQ, Blackwell) for caption + photo analysis"
 
   benchmarker:
     service: null

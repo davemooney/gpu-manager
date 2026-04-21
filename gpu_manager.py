@@ -6,12 +6,19 @@ A lightweight daemon that coordinates GPU usage across multiple services:
 - vLLM (Qwen LLM inference)
 - TheEar (audio processing)
 - Ollama (local LLM)
+- sglang-vision (Qwen2.5-VL captioning)
+- forma-avatar (Flux Kontext + PuLID)
 
 Runs on port 9090, manages service lifecycle via systemctl.
 
 ENFORCEMENT: Only services with active leases are allowed to run.
 On startup, all managed services are stopped to establish a clean baseline.
 A watchdog task periodically stops any service running without a lease.
+
+CPU CONTENTION (Tier 2): Clients with `cpu_contention: true` in their config
+get auto-paused when a priority >= normal lease is granted, and auto-unpaused
+when the last blocking lease releases. Ref-counted by blocker lease_id so
+overlapping high-priority leases don't accidentally unpause early.
 """
 
 import os
@@ -19,16 +26,17 @@ import uuid
 import time
 import subprocess
 import asyncio
+from collections import deque
 from datetime import datetime
 from typing import Optional
 from pathlib import Path
 
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="GPU Resource Manager", version="2.0.0")
+app = FastAPI(title="GPU Resource Manager", version="2.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,7 +55,13 @@ CONFIG_PATH = os.getenv(
 
 PRIORITY_ORDER = {"critical": 0, "high": 1, "normal": 2, "idle": 3}
 
+# Threshold at which we pause cpu_contention clients. normal (2) and tighter
+# trigger preemption; idle (3) does not.
+CPU_CONTENTION_PRIORITY_THRESHOLD = PRIORITY_ORDER["normal"]
+
 WATCHDOG_INTERVAL = 30  # seconds between enforcement checks
+
+PREEMPTION_LOG_MAX = 500
 
 
 def load_config() -> dict:
@@ -79,6 +93,28 @@ stopped_services: list[str] = []
 
 # Wait queue for denied requests
 wait_queue: list[dict] = []
+
+# CPU-contention pause ledger.
+#   paused_by[blocker_lease_id] = set of client names paused on behalf of this lease.
+# A client can appear under multiple blockers — the manager unpauses it only
+# when NO blocker remains for that client.
+paused_by: dict[str, set[str]] = {}
+
+# In-memory audit log of preemption actions. Oldest first, newest last.
+preemption_log: deque = deque(maxlen=PREEMPTION_LOG_MAX)
+
+
+def _log_preemption(action: str, client: str, reason: str, lease_id: Optional[str]) -> None:
+    """Append an entry to the preemption audit log + stdout."""
+    entry = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "action": action,
+        "client": client,
+        "reason": reason,
+        "lease_id": lease_id,
+    }
+    preemption_log.append(entry)
+    print(f"[GPU-MGR][preempt] {action} client={client} reason={reason} lease={lease_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +229,26 @@ def write_model_env(client_name: str, model: str, config: dict) -> bool:
         return False
 
 
+async def _run_shell(cmd: str, timeout: float = 5.0) -> tuple[int, str, str]:
+    """Run a shell command asynchronously. Returns (returncode, stdout, stderr).
+
+    Separate from subprocess.run so the pause/unpause code path is non-blocking
+    and easy to mock in tests.
+    """
+    proc = await asyncio.create_subprocess_shell(
+        cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise
+    return proc.returncode or 0, stdout.decode(errors="replace"), stderr.decode(errors="replace")
+
+
 async def _check_health(url: str, timeout: float = 3.0) -> bool:
     """Check if a service is healthy by hitting its health URL."""
     try:
@@ -212,6 +268,215 @@ async def notify_client(callback_url: str, message: dict):
             await session.post(callback_url, json=message, timeout=aiohttp.ClientTimeout(total=5))
     except Exception as e:
         print(f"[GPU-MGR] Callback failed ({callback_url}): {e}")
+
+
+# ---------------------------------------------------------------------------
+# CPU-contention preemption
+# ---------------------------------------------------------------------------
+
+def _cpu_contention_candidates(config: dict) -> list[str]:
+    """Names of all clients flagged for CPU-contention preemption."""
+    out = []
+    for name, cfg in config.get("clients", {}).items():
+        if cfg.get("cpu_contention") and cfg.get("preemptible", True):
+            out.append(name)
+    return out
+
+
+def _is_currently_paused(client: str) -> bool:
+    """True if any blocker lease is currently holding `client` paused."""
+    for blockers in paused_by.values():
+        if client in blockers:
+            return True
+    return False
+
+
+async def pause_cpu_contention_clients(blocker_lease_id: str, blocker_client: str, config: dict) -> list[str]:
+    """Pause all cpu_contention clients that are currently active, on behalf
+    of a newly granted blocker lease. Best-effort: failures are logged, not
+    fatal. Returns the list of client names successfully enrolled in the
+    pause ledger for this blocker.
+
+    Ref-counting: if a client is already paused by another blocker, we add
+    ourselves as an additional blocker and skip the shell pause call.
+    """
+    clients_cfg = config.get("clients", {})
+    candidates = _cpu_contention_candidates(config)
+    enrolled: list[str] = []
+
+    # Don't pause ourselves.
+    candidates = [c for c in candidates if c != blocker_client]
+
+    # Ensure the ledger entry exists even if no candidates — keeps release logic simple.
+    paused_by.setdefault(blocker_lease_id, set())
+
+    for name in candidates:
+        cfg = clients_cfg.get(name, {})
+        pause_cmd = cfg.get("pause_command")
+        if not pause_cmd:
+            print(f"[GPU-MGR] Skipping {name}: cpu_contention flagged but no pause_command")
+            continue
+
+        if _is_currently_paused(name):
+            # Already paused by someone else — just add ourselves as a blocker.
+            paused_by[blocker_lease_id].add(name)
+            enrolled.append(name)
+            _log_preemption(
+                action="pause_refcount",
+                client=name,
+                reason=f"already paused, adding blocker={blocker_client}",
+                lease_id=blocker_lease_id,
+            )
+            continue
+
+        try:
+            rc, _out, err = await _run_shell(pause_cmd, timeout=5.0)
+            if rc == 0:
+                paused_by[blocker_lease_id].add(name)
+                enrolled.append(name)
+                _log_preemption(
+                    action="pause",
+                    client=name,
+                    reason=f"cpu_contention blocker={blocker_client}",
+                    lease_id=blocker_lease_id,
+                )
+            else:
+                _log_preemption(
+                    action="pause_failed",
+                    client=name,
+                    reason=f"rc={rc} stderr={err.strip()[:120]}",
+                    lease_id=blocker_lease_id,
+                )
+        except asyncio.TimeoutError:
+            _log_preemption(
+                action="pause_failed",
+                client=name,
+                reason="timeout",
+                lease_id=blocker_lease_id,
+            )
+        except Exception as e:
+            _log_preemption(
+                action="pause_failed",
+                client=name,
+                reason=f"exception={e}",
+                lease_id=blocker_lease_id,
+            )
+
+    return enrolled
+
+
+async def unpause_for_released_lease(lease_id: str, config: dict) -> list[str]:
+    """Remove a blocker from the pause ledger. For each client it was holding,
+    if no other blocker remains, issue unpause_command. Returns the list of
+    client names actually unpaused (not including still-held-by-another)."""
+    clients_cfg = config.get("clients", {})
+    formerly_held = paused_by.pop(lease_id, set())
+    unpaused: list[str] = []
+
+    for name in formerly_held:
+        # If another blocker still holds this client, leave it paused.
+        if _is_currently_paused(name):
+            _log_preemption(
+                action="unpause_skipped",
+                client=name,
+                reason="another blocker still active",
+                lease_id=lease_id,
+            )
+            continue
+
+        # Look up the unpause command from the CURRENT config (which may have
+        # been reloaded since the pause fired — that's fine, we just need the
+        # command to run).
+        cfg = clients_cfg.get(name, {})
+        unpause_cmd = cfg.get("unpause_command")
+        if not unpause_cmd:
+            _log_preemption(
+                action="unpause_skipped",
+                client=name,
+                reason="no unpause_command in current config",
+                lease_id=lease_id,
+            )
+            continue
+
+        try:
+            rc, _out, err = await _run_shell(unpause_cmd, timeout=5.0)
+            if rc == 0:
+                unpaused.append(name)
+                _log_preemption(
+                    action="unpause",
+                    client=name,
+                    reason="last blocker released",
+                    lease_id=lease_id,
+                )
+            else:
+                _log_preemption(
+                    action="unpause_failed",
+                    client=name,
+                    reason=f"rc={rc} stderr={err.strip()[:120]}",
+                    lease_id=lease_id,
+                )
+        except asyncio.TimeoutError:
+            _log_preemption(
+                action="unpause_failed",
+                client=name,
+                reason="timeout",
+                lease_id=lease_id,
+            )
+        except Exception as e:
+            _log_preemption(
+                action="unpause_failed",
+                client=name,
+                reason=f"exception={e}",
+                lease_id=lease_id,
+            )
+
+    return unpaused
+
+
+async def boot_time_unpause_sweep(config: dict) -> None:
+    """At manager startup, best-effort unpause every cpu_contention client so
+    we recover from a crash that stranded containers paused. INFO on success,
+    WARN on failure. Each client is unpaused at most once per sweep."""
+    for name, cfg in config.get("clients", {}).items():
+        if not cfg.get("cpu_contention"):
+            continue
+        unpause_cmd = cfg.get("unpause_command")
+        if not unpause_cmd:
+            continue
+        try:
+            rc, _out, err = await _run_shell(unpause_cmd, timeout=5.0)
+            if rc == 0:
+                print(f"[GPU-MGR][boot-sweep] INFO: unpaused {name}")
+                _log_preemption(
+                    action="boot_unpause",
+                    client=name,
+                    reason="manager startup defensive sweep",
+                    lease_id=None,
+                )
+            else:
+                print(f"[GPU-MGR][boot-sweep] WARN: {name} unpause rc={rc} stderr={err.strip()[:120]}")
+                _log_preemption(
+                    action="boot_unpause_failed",
+                    client=name,
+                    reason=f"rc={rc} stderr={err.strip()[:120]}",
+                    lease_id=None,
+                )
+        except asyncio.TimeoutError:
+            print(f"[GPU-MGR][boot-sweep] WARN: {name} unpause timed out")
+            _log_preemption(
+                action="boot_unpause_failed",
+                client=name,
+                reason="timeout",
+                lease_id=None,
+            )
+        except Exception as e:
+            print(f"[GPU-MGR][boot-sweep] WARN: {name} unpause raised {e}")
+            _log_preemption(
+                action="boot_unpause_failed",
+                client=name,
+                reason=f"exception={e}",
+                lease_id=None,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +550,7 @@ class AcquireResponse(BaseModel):
     granted: bool
     vram_mb: int = 0
     preempted: list[str] = []
+    paused: list[str] = []
     message: str = ""
     queue_position: Optional[int] = None
     service_started: bool = False
@@ -305,11 +571,17 @@ class ReleaseRequest(BaseModel):
 async def status():
     """Current GPU state, active leases, and stopped services."""
     gpus = get_gpu_vram()
+    # Summarise paused ledger as {client: [blocker_lease_id, ...]}
+    paused_summary: dict[str, list[str]] = {}
+    for blocker, clients in paused_by.items():
+        for c in clients:
+            paused_summary.setdefault(c, []).append(blocker)
     return {
         "gpus": gpus,
         "total_free_mb": sum(g["free_mb"] for g in gpus),
         "active_leases": {k: v.model_dump() for k, v in active_leases.items()},
         "stopped_services": stopped_services,
+        "paused_clients": paused_summary,
         "wait_queue_length": len(wait_queue),
         "watchdog_interval": WATCHDOG_INTERVAL,
     }
@@ -328,6 +600,10 @@ async def acquire_lease(req: AcquireRequest):
 
     If the client has a start_command, the service is auto-started after
     the lease is granted and we wait for it to become healthy.
+
+    If the lease's priority is >= normal, any clients flagged
+    `cpu_contention: true` in the config are paused (best-effort) before
+    the acquire returns.
     """
     config = load_config()
 
@@ -409,6 +685,8 @@ async def acquire_lease(req: AcquireRequest):
             # Stop the service
             stop_service(lease.client, config)
             del active_leases[lid]
+            # Also release any pause ledger entry held by the preempted lease.
+            await unpause_for_released_lease(lid, config)
             preempted.append(lease.client)
             # Wait briefly for VRAM to free
             await asyncio.sleep(2)
@@ -460,6 +738,17 @@ async def acquire_lease(req: AcquireRequest):
 
     print(f"[GPU-MGR] Lease {lease_id} granted to {req.client} ({req.vram_mb} MiB, priority={req.priority})")
 
+    # CPU-contention preemption: if this lease is priority >= normal, pause
+    # all cpu_contention:true clients. Best-effort — failures are logged, not
+    # fatal.
+    paused: list[str] = []
+    req_priority = PRIORITY_ORDER.get(req.priority, 2)
+    if req_priority <= CPU_CONTENTION_PRIORITY_THRESHOLD:
+        try:
+            paused = await pause_cpu_contention_clients(lease_id, req.client, config)
+        except Exception as e:
+            print(f"[GPU-MGR] pause_cpu_contention_clients error: {e}")
+
     # Write model env file if model specified and client supports it
     if req.model:
         write_model_env(req.client, req.model, config)
@@ -491,6 +780,7 @@ async def acquire_lease(req: AcquireRequest):
         granted=True,
         vram_mb=req.vram_mb,
         preempted=preempted,
+        paused=paused,
         message=msg,
         service_started=service_started,
         service_healthy=service_healthy,
@@ -511,10 +801,14 @@ async def release_lease(req: ReleaseRequest):
     config = load_config()
     stop_service(lease.client, config)
 
+    # Unpause any cpu_contention clients that were being held paused by this lease.
+    unpaused = await unpause_for_released_lease(req.lease_id, config)
+
     return {
         "status": "released",
         "lease_id": req.lease_id,
         "client": lease.client,
+        "unpaused": unpaused,
     }
 
 
@@ -536,7 +830,12 @@ async def release_by_client(client_name: str):
     config = load_config()
     stop_service(client_name, config)
 
-    return {"status": "released", "leases": released}
+    # Unpause any cpu_contention clients that were being held paused by these leases.
+    all_unpaused: list[str] = []
+    for lid in released:
+        all_unpaused.extend(await unpause_for_released_lease(lid, config))
+
+    return {"status": "released", "leases": released, "unpaused": all_unpaused}
 
 
 @app.get("/health")
@@ -628,6 +927,146 @@ async def ensure_service(name: str, model: Optional[str] = None):
 
 
 # ---------------------------------------------------------------------------
+# Admin / debug endpoints for CPU contention
+# ---------------------------------------------------------------------------
+
+def _require_loopback(request: Request) -> None:
+    """Raise 403 unless the caller is on loopback. Admin endpoints only."""
+    host = request.client.host if request.client else None
+    if host not in ("127.0.0.1", "::1"):
+        raise HTTPException(403, f"Loopback only (saw {host})")
+
+
+async def _docker_container_state(container_name: str) -> Optional[str]:
+    """Query `docker inspect ... --format={{.State.Status}}`. Returns the
+    raw state string (e.g. 'running', 'paused', 'exited') or None on error."""
+    cmd = f"docker inspect {container_name} --format='{{{{.State.Status}}}}'"
+    try:
+        rc, stdout, _err = await _run_shell(cmd, timeout=3.0)
+        if rc != 0:
+            return None
+        # strip quotes + whitespace
+        return stdout.strip().strip("'").strip('"') or None
+    except Exception:
+        return None
+
+
+def _infer_container_name(client: str, cfg: dict) -> Optional[str]:
+    """Best-effort pluck the docker container name out of pause_command. Most
+    of our clients use `docker pause <name>` so we parse that. Returns None
+    if we can't figure it out."""
+    pause_cmd = cfg.get("pause_command") or ""
+    if "docker pause" in pause_cmd:
+        parts = pause_cmd.replace("docker pause", "").strip().split()
+        if parts:
+            return parts[0]
+    return None
+
+
+@app.get("/clients/{name}/state")
+async def client_state(name: str):
+    """Return one of: running | paused | stopped | starting.
+
+    Primary source of truth: our internal pause ledger. If the client is in
+    the ledger → paused. Otherwise, if the client has docker-backed
+    pause/unpause commands, we fall through to `docker inspect` so the answer
+    stays truthful across manager restarts. Finally, fall back to the health
+    check + lease state."""
+    config = load_config()
+    cfg = config.get("clients", {}).get(name)
+    if not cfg:
+        raise HTTPException(404, f"Unknown client: {name}")
+
+    # Ledger check first — this is what WE know.
+    if _is_currently_paused(name):
+        return {"client": name, "state": "paused", "source": "ledger"}
+
+    # Docker inspect fallback for clients with pause commands.
+    container = _infer_container_name(name, cfg)
+    if container:
+        raw = await _docker_container_state(container)
+        if raw == "paused":
+            return {"client": name, "state": "paused", "source": "docker"}
+        if raw == "running":
+            return {"client": name, "state": "running", "source": "docker"}
+        if raw in ("exited", "dead", "created"):
+            return {"client": name, "state": "stopped", "source": "docker"}
+        if raw == "restarting":
+            return {"client": name, "state": "starting", "source": "docker"}
+
+    # Last-resort: health check + lease state.
+    has_lease = any(l.client == name for l in active_leases.values())
+    health_url = cfg.get("health_check")
+    if health_url:
+        healthy = await _check_health(health_url)
+        if healthy:
+            return {"client": name, "state": "running", "source": "health"}
+        if has_lease:
+            return {"client": name, "state": "starting", "source": "health"}
+        return {"client": name, "state": "stopped", "source": "health"}
+
+    if is_service_active(name, config):
+        return {"client": name, "state": "running", "source": "systemd"}
+    return {"client": name, "state": "stopped", "source": "systemd"}
+
+
+@app.post("/clients/{name}/pause")
+async def admin_pause(name: str, request: Request):
+    """Loopback-only: directly pause a client, no lease required."""
+    _require_loopback(request)
+    config = load_config()
+    cfg = config.get("clients", {}).get(name)
+    if not cfg:
+        raise HTTPException(404, f"Unknown client: {name}")
+    pause_cmd = cfg.get("pause_command")
+    if not pause_cmd:
+        raise HTTPException(400, f"No pause_command configured for {name}")
+    try:
+        rc, _out, err = await _run_shell(pause_cmd, timeout=5.0)
+    except asyncio.TimeoutError:
+        _log_preemption("admin_pause_failed", name, "timeout", None)
+        raise HTTPException(504, "pause timed out")
+    if rc != 0:
+        _log_preemption("admin_pause_failed", name, f"rc={rc} stderr={err.strip()[:120]}", None)
+        raise HTTPException(500, f"pause failed rc={rc}: {err.strip()[:200]}")
+    _log_preemption("admin_pause", name, "manual loopback request", None)
+    return {"client": name, "paused": True}
+
+
+@app.post("/clients/{name}/unpause")
+async def admin_unpause(name: str, request: Request):
+    """Loopback-only: directly unpause a client, regardless of ledger state."""
+    _require_loopback(request)
+    config = load_config()
+    cfg = config.get("clients", {}).get(name)
+    if not cfg:
+        raise HTTPException(404, f"Unknown client: {name}")
+    unpause_cmd = cfg.get("unpause_command")
+    if not unpause_cmd:
+        raise HTTPException(400, f"No unpause_command configured for {name}")
+    try:
+        rc, _out, err = await _run_shell(unpause_cmd, timeout=5.0)
+    except asyncio.TimeoutError:
+        _log_preemption("admin_unpause_failed", name, "timeout", None)
+        raise HTTPException(504, "unpause timed out")
+    if rc != 0:
+        _log_preemption("admin_unpause_failed", name, f"rc={rc} stderr={err.strip()[:120]}", None)
+        raise HTTPException(500, f"unpause failed rc={rc}: {err.strip()[:200]}")
+    _log_preemption("admin_unpause", name, "manual loopback request", None)
+    return {"client": name, "paused": False}
+
+
+@app.get("/preemption_log")
+async def get_preemption_log(limit: int = 50):
+    """Return the last `limit` entries from the preemption audit log.
+    Newest last."""
+    if limit <= 0:
+        return {"entries": [], "total": len(preemption_log)}
+    entries = list(preemption_log)[-limit:]
+    return {"entries": entries, "total": len(preemption_log)}
+
+
+# ---------------------------------------------------------------------------
 # Startup & Watchdog
 # ---------------------------------------------------------------------------
 
@@ -640,6 +1079,9 @@ async def on_startup():
     gpus = get_gpu_vram()
     for g in gpus:
         print(f"[GPU-MGR] GPU {g['index']}: {g['total_mb']} MiB total, {g['free_mb']} MiB free")
+
+    # Defensive unpause — recover any containers stranded paused by a prior crash.
+    await boot_time_unpause_sweep(config)
 
     # ENFORCEMENT: Stop all managed services to establish clean baseline
     print("[GPU-MGR] Enforcing clean baseline — stopping all managed services...")
