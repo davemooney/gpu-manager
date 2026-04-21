@@ -10,7 +10,7 @@ fi
 
 CONTAINER_NAME="sglang-llm"
 PORT=8001
-MEM_FRACTION=0.7
+MEM_FRACTION=0.35
 EXTRA_ARGS=""
 
 # Vision-language models need --enable-multimodal
