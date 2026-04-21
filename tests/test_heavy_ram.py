@@ -100,3 +100,297 @@ class TestFoundation:
         assert body["preempted_state"] == {"vllm": "paused"}
         assert body["preempted_since"] == {"vllm": 1234.5}
         assert "heavy_ram_enabled" in body
+
+
+# ---------------------------------------------------------------------------
+# WP-102-02: schedule_restart + _delayed_restart
+# ---------------------------------------------------------------------------
+
+
+import asyncio  # noqa: E402
+
+
+@pytest.fixture
+def _clean_restart_tasks():
+    """Cancel and discard any residual scheduled restart tasks on the module.
+
+    Complements `clean_state` from conftest: that fixture doesn't know about
+    `restart_tasks` (added in WP-102-02), so clean it here.
+    """
+    # Best-effort cancel anything left from a previous test.
+    for task in list(gm.restart_tasks.values()):
+        if not task.done():
+            task.cancel()
+    gm.restart_tasks.clear()
+    yield
+    for task in list(gm.restart_tasks.values()):
+        if not task.done():
+            task.cancel()
+    gm.restart_tasks.clear()
+
+
+class TestRestartScheduler:
+    """Unit tests for `schedule_restart` + `_delayed_restart`."""
+
+    @pytest.mark.asyncio
+    async def test_schedule_restart_cancels_existing(
+        self, clean_state, _clean_restart_tasks, monkeypatch
+    ):
+        """A second schedule_restart for the same client cancels the first."""
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+
+        async def fake_shell(cmd, timeout=5.0):
+            return (0, "", "")
+
+        async def fake_health(url, timeout=3.0):
+            return True
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        monkeypatch.setattr(gm, "_check_health", fake_health)
+        monkeypatch.setattr(
+            gm,
+            "load_config",
+            lambda: {
+                "clients": {
+                    "x": {
+                        "start_command": "true",
+                        "health_check": "http://x",
+                        "startup_seconds": 5,
+                    }
+                }
+            },
+        )
+
+        gm.schedule_restart("x", delay_s=10)
+        t1 = gm.restart_tasks["x"]
+        gm.schedule_restart("x", delay_s=10)
+        t2 = gm.restart_tasks["x"]
+        assert t1 is not t2
+        # Give the event loop a tick so the cancellation propagates.
+        try:
+            await t1
+        except asyncio.CancelledError:
+            pass
+        assert t1.cancelled() or t1.done()
+
+        t2.cancel()
+        try:
+            await t2
+        except asyncio.CancelledError:
+            pass
+
+    @pytest.mark.asyncio
+    async def test_happy_path_restarts_and_health_ok(
+        self, clean_state, _clean_restart_tasks, monkeypatch
+    ):
+        """Start command runs, health comes up, preempted_state is cleared."""
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+        calls: list[str] = []
+
+        async def fake_shell(cmd, timeout=5.0):
+            calls.append(cmd)
+            return (0, "", "")
+
+        async def fake_health(url, timeout=3.0):
+            return True
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        monkeypatch.setattr(gm, "_check_health", fake_health)
+        monkeypatch.setattr(
+            gm,
+            "load_config",
+            lambda: {
+                "clients": {
+                    "x": {
+                        "start_command": "/tmp/start.sh",
+                        "health_check": "http://x",
+                        "startup_seconds": 5,
+                    }
+                }
+            },
+        )
+
+        gm.preempted_state["x"] = "stopped"
+        gm.preempted_since["x"] = 0.0
+
+        gm.schedule_restart("x", delay_s=0)
+        await asyncio.wait_for(gm.restart_tasks["x"], timeout=3.0)
+
+        assert "x" not in gm.preempted_state
+        assert "x" not in gm.preempted_since
+        assert "x" not in gm.restart_tasks
+        assert any("/tmp/start.sh" in c for c in calls)
+        # preemption_log should record the ok action.
+        assert any(
+            e.get("action") == "restart_ok" and e.get("client") == "x"
+            for e in gm.preemption_log
+        )
+
+    @pytest.mark.asyncio
+    async def test_feature_flag_off_is_noop(
+        self, clean_state, _clean_restart_tasks, monkeypatch
+    ):
+        """With the flag disabled, schedule_restart does nothing."""
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", False)
+        gm.schedule_restart("x", delay_s=0)
+        assert "x" not in gm.restart_tasks
+
+    @pytest.mark.asyncio
+    async def test_cancel_before_fire_leaves_state_untouched(
+        self, clean_state, _clean_restart_tasks, monkeypatch
+    ):
+        """Cancelling a pending (still-sleeping) task must not touch state."""
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+
+        gm.schedule_restart("x", delay_s=60)
+        task = gm.restart_tasks["x"]
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert "x" not in gm.preempted_state
+        assert "x" not in gm.preempted_since
+
+    @pytest.mark.asyncio
+    async def test_start_command_failure_retries_then_succeeds(
+        self, clean_state, _clean_restart_tasks, monkeypatch
+    ):
+        """First start_command returns non-zero, retry succeeds, state cleared.
+
+        We patch the backoffs to near-zero so the test runs in < 1 s.
+        """
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+
+        # Speed up retries for the test.
+        original_delayed = gm._delayed_restart
+
+        async def fast_delayed(name: str, delay_s: int) -> None:
+            # Shrink the backoff list by monkey-patching in a wrapper that
+            # calls the real function but with a pre-patched module.
+            await original_delayed(name, delay_s)
+
+        # Patch asyncio.sleep used inside _delayed_restart to be instant for
+        # sleeps >= 5 s (retry backoffs) but keep the 2 s health poll honest.
+        real_sleep = asyncio.sleep
+
+        async def fast_sleep(s):
+            if s >= 5:
+                return
+            await real_sleep(0)
+
+        monkeypatch.setattr(gm.asyncio, "sleep", fast_sleep)
+
+        attempts = {"n": 0}
+
+        async def fake_shell(cmd, timeout=5.0):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                return (1, "", "boom")
+            return (0, "", "")
+
+        async def fake_health(url, timeout=3.0):
+            return True
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        monkeypatch.setattr(gm, "_check_health", fake_health)
+        monkeypatch.setattr(
+            gm,
+            "load_config",
+            lambda: {
+                "clients": {
+                    "x": {
+                        "start_command": "/tmp/start.sh",
+                        "health_check": "http://x",
+                        "startup_seconds": 5,
+                    }
+                }
+            },
+        )
+
+        gm.preempted_state["x"] = "stopped"
+        gm.preempted_since["x"] = 0.0
+
+        gm.schedule_restart("x", delay_s=0)
+        await asyncio.wait_for(gm.restart_tasks["x"], timeout=3.0)
+
+        assert attempts["n"] >= 2
+        assert "x" not in gm.preempted_state
+        assert any(
+            e.get("action") == "restart_failed" and e.get("client") == "x"
+            for e in gm.preemption_log
+        )
+        assert any(
+            e.get("action") == "restart_ok" and e.get("client") == "x"
+            for e in gm.preemption_log
+        )
+
+    @pytest.mark.asyncio
+    async def test_exhausted_budget_marks_start_failed(
+        self, clean_state, _clean_restart_tasks, monkeypatch
+    ):
+        """Every start attempt fails → final state is `start_failed`.
+
+        We both collapse the backoff sleeps and shrink the 1 h deadline so the
+        test finishes in under a second.
+        """
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+
+        real_sleep = asyncio.sleep
+
+        async def fast_sleep(s):
+            if s >= 5:
+                return
+            await real_sleep(0)
+
+        monkeypatch.setattr(gm.asyncio, "sleep", fast_sleep)
+
+        # Fake time.time so the 1 h deadline is reached after a few iterations.
+        # We let the first attempt proceed, then jump forward past the deadline
+        # so the while-loop exits via the "out of retries" branch.
+        t0 = [1000.0]
+
+        def fake_time():
+            return t0[0]
+
+        monkeypatch.setattr(gm.time, "time", fake_time)
+
+        attempts = {"n": 0}
+
+        async def fake_shell(cmd, timeout=5.0):
+            attempts["n"] += 1
+            # Advance time each retry so the deadline (3600 s) is exceeded
+            # after a small number of attempts.
+            t0[0] += 2000
+            return (1, "", "boom")
+
+        async def fake_health(url, timeout=3.0):
+            return False
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        monkeypatch.setattr(gm, "_check_health", fake_health)
+        monkeypatch.setattr(
+            gm,
+            "load_config",
+            lambda: {
+                "clients": {
+                    "x": {
+                        "start_command": "/tmp/start.sh",
+                        "health_check": "http://x",
+                        "startup_seconds": 5,
+                    }
+                }
+            },
+        )
+
+        gm.schedule_restart("x", delay_s=0)
+        await asyncio.wait_for(gm.restart_tasks["x"], timeout=3.0)
+
+        assert gm.preempted_state.get("x") == "start_failed"
+        assert "x" in gm.preempted_since
+        assert "x" not in gm.restart_tasks
+        assert any(
+            e.get("action") == "start_failed" and e.get("client") == "x"
+            for e in gm.preemption_log
+        )
