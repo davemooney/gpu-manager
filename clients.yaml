@@ -1,0 +1,84 @@
+clients:
+  vllm:
+    service: null
+    default_vram_mb: 29000
+    priority: idle
+    preemptible: true
+    start_command: "/home/aidin/sglang-launch.sh"
+    stop_command: "docker stop sglang-llm; docker rm sglang-llm"
+    health_check: "http://localhost:8001/v1/models"
+    startup_seconds: 180
+    model_env_file: "/home/aidin/.config/vllm/model.env"
+    model_env_var: "VLLM_MODEL"
+    description: "SGLang LLM inference (Docker, Blackwell)"
+
+  benchmarker:
+    service: null
+    default_vram_mb: 40000
+    priority: high
+    preemptible: false
+    start_command: "/home/aidin/sglang-bench-launch.sh"
+    stop_command: "docker stop sglang-bench; docker rm sglang-bench"
+    health_check: "http://localhost:8002/v1/models"
+    startup_seconds: 180
+    model_env_file: "/home/aidin/.config/vllm/model.env"
+    model_env_var: "VLLM_MODEL"
+    description: "Sovereign Benchmarker — large models (separate container)"
+
+  nosonix:
+    service: null
+    default_vram_mb: 4000
+    priority: normal
+    preemptible: true
+    callback_url: "http://localhost:8000/gpu/callback"
+    health_check: "http://localhost:8000/benchmark"
+    description: "noSonix Parakeet transcription"
+
+  theear:
+    service: theear-worker.service
+    default_vram_mb: 8000
+    priority: normal
+    preemptible: true
+    start_command: "sudo systemctl start theear-worker"
+    stop_command: "sudo systemctl stop theear-worker"
+    description: "TheEar audio analysis worker"
+
+  ollama:
+    service: ollama.service
+    default_vram_mb: 4000
+    priority: idle
+    preemptible: true
+    start_command: "sudo systemctl start ollama"
+    stop_command: "sudo systemctl stop ollama"
+    health_check: "http://localhost:11434/api/tags"
+    description: "Ollama local LLM"
+
+  diffusion:
+    service: null
+    default_vram_mb: 8000
+    priority: normal
+    preemptible: true
+    start_command: "/home/aidin/diffusion-server/food-image-launch.sh"
+    stop_command: "pkill -f 'food_image_server:app' || true"
+    health_check: "http://localhost:8003/health"
+    startup_seconds: 120
+    description: "Food image generation (SDXL / FLUX diffusion)"
+
+  forma-avatar:
+    service: null
+    default_vram_mb: 28000
+    priority: normal
+    preemptible: true
+    callback_url: "http://localhost:8420/gpu/callback"
+    health_check: "http://localhost:8420/api/health"
+    start_command: "systemctl --user start forma-server"
+    stop_command: "systemctl --user stop forma-server"
+    startup_seconds: 180
+    description: "Forma Avatar Lab — Flux Kontext + PuLID + InsightFace"
+
+  forma-avatar-training:
+    service: null
+    default_vram_mb: 24000
+    priority: normal
+    preemptible: false
+    description: "Forma Avatar LoRA training (ai-toolkit subprocess, GPU 0)"
