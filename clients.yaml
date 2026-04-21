@@ -8,6 +8,10 @@
 #   cpu_contention    bool (NEW) — client pins significant CPU; pause when a
 #                     priority >= normal lease is acquired, unpause on release.
 #                     Defaults to false when absent. Backwards-compatible.
+#   keepalive         bool (NEW) — exempt from the watchdog's "stop if no lease"
+#                     enforcement. Long-running baseline services (sglang, VLM,
+#                     forma-server, etc.) stay up between leases and rely on
+#                     pause/unpause or lifecycle signals instead of full stops.
 #   start_command     shell command to launch
 #   stop_command      shell command to fully stop
 #   pause_command     (NEW) shell command to pause without tearing down
@@ -28,6 +32,7 @@ clients:
     priority: idle
     preemptible: true
     cpu_contention: true
+    keepalive: true
     start_command: "/home/aidin/sglang-launch.sh"
     stop_command: "docker stop sglang-llm; docker rm sglang-llm"
     pause_command: "docker pause sglang-llm"
@@ -44,6 +49,7 @@ clients:
     priority: idle
     preemptible: true
     cpu_contention: true
+    keepalive: true
     start_command: "/home/aidin/sglang-vision-launch.sh"
     stop_command: "docker stop sglang-vision; docker rm sglang-vision"
     pause_command: "docker pause sglang-vision"
@@ -109,6 +115,7 @@ clients:
     default_vram_mb: 28000
     priority: normal
     preemptible: true
+    keepalive: true
     callback_url: "http://localhost:8420/gpu/callback"
     health_check: "http://localhost:8420/api/health"
     start_command: "systemctl --user start forma-server"

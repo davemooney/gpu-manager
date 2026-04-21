@@ -530,6 +530,16 @@ async def enforce_leases():
         if name in leased_clients:
             continue  # Has a lease — allowed to run
 
+        # Tier-3 integration (davemooney/avatar#100): services marked
+        # `keepalive: true` are long-running baseline workloads that
+        # should stay up between leases. They get paused/unpaused via
+        # the CPU-contention + lifecycle-callback paths instead of
+        # stopped. The original watchdog would fight the pause/unpause
+        # cycle by recycling the whole container each time its lease
+        # was released.
+        if cfg.get("keepalive", False):
+            continue
+
         if not cfg.get("stop_command"):
             continue  # Not a managed service (e.g. nosonix has no stop_command)
 
