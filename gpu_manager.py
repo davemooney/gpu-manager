@@ -19,6 +19,15 @@ CPU CONTENTION (Tier 2): Clients with `cpu_contention: true` in their config
 get auto-paused when a priority >= normal lease is granted, and auto-unpaused
 when the last blocking lease releases. Ref-counted by blocker lease_id so
 overlapping high-priority leases don't accidentally unpause early.
+
+LIFECYCLE ROUTER (Tier 3): Clients POST their lifecycle state transitions
+(`idle` / `preflight` / `generating` / `cooldown`) to
+`POST /lifecycle/{source}`. The manager fans out the envelope concurrently to
+every OTHER registered client with a `callback_url`, and falls back to the
+Tier-2 pause/unpause path for clients that haven't implemented their own
+callback (gated on `preemptible + cpu_contention`). Lifecycle-driven pauses
+share the same ref-counted `paused_by` ledger as real leases via synthetic
+keys of the form `lifecycle:{source}`.
 """
 
 import os
@@ -63,10 +72,26 @@ WATCHDOG_INTERVAL = 30  # seconds between enforcement checks
 
 PREEMPTION_LOG_MAX = 500
 
+# Tier-3 lifecycle router constants
+LIFECYCLE_LOG_MAX = 500
+LIFECYCLE_PROTOCOL_VERSION = 1
+LIFECYCLE_VALID_STATES = {"idle", "preflight", "generating", "cooldown"}
+# Per-target HTTP timeout when fanning out lifecycle events to peer callbacks.
+LIFECYCLE_FANOUT_TIMEOUT_SECONDS = 1.0
+
 
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f)
+
+
+def _lifecycle_blocker_key(source_client: str) -> str:
+    """Synthetic paused_by ledger key for a lifecycle-driven blocker.
+
+    Real leases are keyed by their UUID (e.g. `lease-abc123`); lifecycle
+    signals use the format `lifecycle:{source_client}` so one ref-counting
+    codepath can handle both."""
+    return f"lifecycle:{source_client}"
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +127,11 @@ paused_by: dict[str, set[str]] = {}
 
 # In-memory audit log of preemption actions. Oldest first, newest last.
 preemption_log: deque = deque(maxlen=PREEMPTION_LOG_MAX)
+
+# In-memory audit log of lifecycle events received + fan-out outcomes.
+# Parallel to preemption_log but recording the router-side of the Tier 3
+# protocol. Oldest first, newest last.
+lifecycle_log: deque = deque(maxlen=LIFECYCLE_LOG_MAX)
 
 
 def _log_preemption(action: str, client: str, reason: str, lease_id: Optional[str]) -> None:
@@ -563,6 +593,20 @@ class ReleaseRequest(BaseModel):
     lease_id: str
 
 
+class LifecycleEnvelope(BaseModel):
+    """Tier-3 lifecycle event envelope.
+
+    Shape is the source-of-truth for both emitter (forma-avatar) and router
+    (this manager). Matches `doc/design/gpu-lifecycle-protocol.md` in
+    davemooney/avatar.
+    """
+    source: str
+    state: str
+    version: int = LIFECYCLE_PROTOCOL_VERSION
+    timestamp: Optional[str] = None
+    context: dict = {}
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -924,6 +968,280 @@ async def ensure_service(name: str, model: Optional[str] = None):
         "model": result.model,
         "model_switched": result.model_switched,
     }
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 — Lifecycle callback protocol
+# ---------------------------------------------------------------------------
+
+def _log_lifecycle(entry: dict) -> None:
+    """Append a lifecycle event entry to the audit deque + stdout."""
+    lifecycle_log.append(entry)
+    print(
+        f"[GPU-MGR][lifecycle] source={entry.get('source')} "
+        f"state={entry.get('state')} targets={entry.get('targets')} "
+        f"failures={entry.get('failures')}"
+    )
+
+
+async def _post_lifecycle_callback(
+    target_name: str,
+    callback_url: str,
+    envelope: dict,
+    timeout: float = LIFECYCLE_FANOUT_TIMEOUT_SECONDS,
+) -> dict:
+    """POST the envelope to a peer's callback URL. Returns a per-target
+    delivery record, never raises. Used inside `asyncio.gather` so one slow
+    target doesn't stall the fan-out."""
+    record = {"target": target_name, "callback_url": callback_url, "status": "ok"}
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                callback_url,
+                json=envelope,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                record["http_status"] = resp.status
+                if resp.status >= 400:
+                    record["status"] = "http_error"
+                    print(
+                        f"[GPU-MGR][lifecycle] WARN: callback {target_name} "
+                        f"returned HTTP {resp.status}"
+                    )
+    except asyncio.TimeoutError:
+        record["status"] = "timeout"
+        print(f"[GPU-MGR][lifecycle] WARN: callback {target_name} timed out")
+    except Exception as e:  # noqa: BLE001 — best-effort delivery
+        record["status"] = "error"
+        record["error"] = str(e)[:200]
+        print(f"[GPU-MGR][lifecycle] WARN: callback {target_name} raised {e}")
+    return record
+
+
+async def _pause_for_lifecycle(
+    source_client: str, config: dict
+) -> tuple[list[str], list[str]]:
+    """Legacy fallback: pause cpu_contention clients on behalf of a lifecycle
+    `generating` signal. Shares the `paused_by` ledger with real leases via
+    a synthetic `lifecycle:{source}` key.
+
+    Returns (newly_enrolled, already_held) where:
+      - newly_enrolled: clients we acted upon for this blocker
+      - already_held: clients that were already paused by another blocker
+        (we just added ourselves to the ref-count)
+    """
+    clients_cfg = config.get("clients", {})
+    candidates = _cpu_contention_candidates(config)
+    enrolled: list[str] = []
+    already_held: list[str] = []
+
+    blocker_key = _lifecycle_blocker_key(source_client)
+
+    # Don't pause the emitter itself if it's also in the candidate set.
+    candidates = [c for c in candidates if c != source_client]
+
+    # Ensure ledger entry exists so release works uniformly even with no targets.
+    paused_by.setdefault(blocker_key, set())
+
+    for name in candidates:
+        cfg = clients_cfg.get(name, {})
+        pause_cmd = cfg.get("pause_command")
+        if not pause_cmd:
+            continue
+
+        if _is_currently_paused(name):
+            paused_by[blocker_key].add(name)
+            enrolled.append(name)
+            already_held.append(name)
+            _log_preemption(
+                action="pause_refcount",
+                client=name,
+                reason=f"already paused, adding lifecycle blocker={source_client}",
+                lease_id=blocker_key,
+            )
+            continue
+
+        try:
+            rc, _out, err = await _run_shell(pause_cmd, timeout=5.0)
+            if rc == 0:
+                paused_by[blocker_key].add(name)
+                enrolled.append(name)
+                _log_preemption(
+                    action="pause",
+                    client=name,
+                    reason=f"lifecycle generating from {source_client}",
+                    lease_id=blocker_key,
+                )
+            else:
+                _log_preemption(
+                    action="pause_failed",
+                    client=name,
+                    reason=f"rc={rc} stderr={err.strip()[:120]}",
+                    lease_id=blocker_key,
+                )
+        except asyncio.TimeoutError:
+            _log_preemption(
+                action="pause_failed",
+                client=name,
+                reason="timeout",
+                lease_id=blocker_key,
+            )
+        except Exception as e:  # noqa: BLE001
+            _log_preemption(
+                action="pause_failed",
+                client=name,
+                reason=f"exception={e}",
+                lease_id=blocker_key,
+            )
+
+    return enrolled, already_held
+
+
+async def _unpause_for_lifecycle(source_client: str, config: dict) -> list[str]:
+    """Release the synthetic lifecycle blocker and unpause any clients whose
+    ref-count hits zero. Reuses the exact same unpause path as real leases."""
+    blocker_key = _lifecycle_blocker_key(source_client)
+    return await unpause_for_released_lease(blocker_key, config)
+
+
+@app.post("/lifecycle/{source_client}")
+async def lifecycle_event(source_client: str, envelope: LifecycleEnvelope):
+    """Receive a lifecycle transition from a registered client.
+
+    Validates + logs the event, fans out the envelope concurrently to every
+    OTHER registered client with a `callback_url` (per-target 1s timeout),
+    and applies the legacy pause/unpause fallback for clients that haven't
+    implemented their own callback.
+    """
+    config = load_config()
+    clients = config.get("clients", {})
+
+    if source_client not in clients:
+        raise HTTPException(404, f"Unknown source client: {source_client}")
+
+    if envelope.version != LIFECYCLE_PROTOCOL_VERSION:
+        raise HTTPException(
+            400,
+            f"unsupported protocol version {envelope.version} "
+            f"(expected {LIFECYCLE_PROTOCOL_VERSION})",
+        )
+
+    if envelope.state not in LIFECYCLE_VALID_STATES:
+        raise HTTPException(
+            422,
+            f"Invalid state '{envelope.state}' "
+            f"(expected one of {sorted(LIFECYCLE_VALID_STATES)})",
+        )
+
+    # Envelope we actually forward — always use the URL path source so peers
+    # don't have to cross-check `source` against the URL.
+    forwarded = envelope.model_dump()
+    forwarded["source"] = source_client
+    # Timestamp the router's view of the event if the producer didn't set one.
+    if not forwarded.get("timestamp"):
+        forwarded["timestamp"] = datetime.utcnow().isoformat()
+
+    # Identify fan-out targets (every OTHER client with a callback_url).
+    fanout_targets: list[tuple[str, str]] = []
+    legacy_targets: list[str] = []
+    for name, cfg in clients.items():
+        if name == source_client:
+            continue
+        cb = cfg.get("callback_url")
+        if cb:
+            fanout_targets.append((name, cb))
+        elif cfg.get("preemptible", True) and cfg.get("cpu_contention"):
+            legacy_targets.append(name)
+
+    # Concurrent fan-out — one slow target does not delay others.
+    delivery_records: list[dict] = []
+    if fanout_targets:
+        delivery_records = await asyncio.gather(
+            *(
+                _post_lifecycle_callback(name, url, forwarded)
+                for name, url in fanout_targets
+            )
+        )
+
+    # Legacy fallback: translate generating/cooldown into pause/unpause for
+    # cpu_contention clients that haven't adopted the protocol yet.
+    legacy_actions: dict = {}
+    if envelope.state == "generating" and legacy_targets:
+        enrolled, already_held = await _pause_for_lifecycle(source_client, config)
+        legacy_actions = {
+            "mode": "pause",
+            "enrolled": enrolled,
+            "already_held": already_held,
+        }
+    elif envelope.state == "cooldown":
+        # Always attempt an unpause — harmless if the blocker key isn't in the
+        # ledger (release_lease handles that).
+        unpaused = await _unpause_for_lifecycle(source_client, config)
+        legacy_actions = {"mode": "unpause", "unpaused": unpaused}
+    # idle / preflight → no-op for the legacy path.
+
+    failures = [r for r in delivery_records if r["status"] != "ok"]
+    entry = {
+        "timestamp": forwarded["timestamp"],
+        "source": source_client,
+        "state": envelope.state,
+        "targets": [name for name, _ in fanout_targets],
+        "deliveries": delivery_records,
+        "failures": len(failures),
+        "legacy_targets": legacy_targets,
+        "legacy_actions": legacy_actions,
+        "context": forwarded.get("context", {}),
+    }
+    _log_lifecycle(entry)
+
+    return {
+        "status": "ok",
+        "source": source_client,
+        "state": envelope.state,
+        "fanout": {
+            "targets": [name for name, _ in fanout_targets],
+            "deliveries": delivery_records,
+            "failures": len(failures),
+        },
+        "legacy": legacy_actions,
+    }
+
+
+@app.get("/lifecycle_log")
+async def get_lifecycle_log(request: Request, limit: int = 50):
+    """Return the last `limit` entries from the lifecycle audit log.
+
+    Loopback-only — the endpoint exposes per-target callback URLs and
+    delivery outcomes, which aren't something we want leaking off-host.
+    """
+    _require_loopback(request)
+    if limit <= 0:
+        return {"entries": [], "total": len(lifecycle_log)}
+    entries = list(lifecycle_log)[-limit:]
+    return {"entries": entries, "total": len(lifecycle_log)}
+
+
+@app.get("/lifecycle/state")
+async def get_lifecycle_state(request: Request):
+    """Return the manager's view of each source's current external-busy state.
+
+    Derived from `lifecycle_log`: the latest non-`cooldown` state per source.
+    Once a source transitions to `cooldown` it drops out of the busy map,
+    since cooldown means \"no longer generating\".
+    """
+    _require_loopback(request)
+    current: dict[str, str] = {}
+    for entry in lifecycle_log:
+        source = entry.get("source")
+        state = entry.get("state")
+        if not source:
+            continue
+        if state == "cooldown":
+            current.pop(source, None)
+        elif state in LIFECYCLE_VALID_STATES:
+            current[source] = state
+    return {"sources": current}
 
 
 # ---------------------------------------------------------------------------
