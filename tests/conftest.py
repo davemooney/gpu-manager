@@ -157,3 +157,61 @@ def gpu_manager_module(monkeypatch, config_file: Path):
     monkeypatch.setattr(gpu_manager, "_check_health", fake_health)
 
     yield gpu_manager, recorder
+
+
+# ---------------------------------------------------------------------------
+# Heavy-ram foundation fixtures (WP-102-01)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def clean_state():
+    """Reset all mutable module-level dicts/deques on `gpu_manager` and yield
+    the current module. Used by the heavy_ram foundation tests that work with
+    the module reference imported at test-module load time (`import gpu_manager
+    as gm`), without forcing a reimport.
+    """
+    import gpu_manager as gm  # noqa: WPS433 — lazy import inside fixture
+    gm.active_leases.clear()
+    gm.stopped_services.clear()
+    gm.wait_queue.clear()
+    gm.paused_by.clear()
+    gm.preempted_state.clear()
+    gm.preempted_since.clear()
+    gm.preemption_log.clear()
+    gm.lifecycle_log.clear()
+    yield gm
+    # Tear-down: leave the dicts clean for the next test.
+    gm.active_leases.clear()
+    gm.stopped_services.clear()
+    gm.wait_queue.clear()
+    gm.paused_by.clear()
+    gm.preempted_state.clear()
+    gm.preempted_since.clear()
+    gm.preemption_log.clear()
+    gm.lifecycle_log.clear()
+
+
+@pytest.fixture
+def write_config(tmp_path, monkeypatch):
+    """Factory fixture: call the returned function with a config dict and it
+    writes the YAML to a temp path and points `gpu_manager.CONFIG_PATH` at it
+    (via monkeypatch, auto-reverted at teardown).
+    """
+    cfg_path = tmp_path / "clients.yaml"
+
+    def _write(data: dict) -> Path:
+        cfg_path.write_text(yaml.safe_dump(data))
+        import gpu_manager as gm  # noqa: WPS433
+        monkeypatch.setattr(gm, "CONFIG_PATH", str(cfg_path))
+        return cfg_path
+
+    return _write
+
+
+@pytest.fixture
+def loopback_client():
+    """TestClient whose `request.client.host` reads as 127.0.0.1. Use for
+    exercising loopback-gated endpoints."""
+    from fastapi.testclient import TestClient
+    import gpu_manager as gm  # noqa: WPS433
+    return TestClient(gm.app, client=("127.0.0.1", 0))
