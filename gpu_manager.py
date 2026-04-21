@@ -369,20 +369,28 @@ def _is_currently_paused(client: str) -> bool:
     return False
 
 
-async def pause_cpu_contention_clients(blocker_lease_id: str, blocker_client: str, config: dict) -> list[str]:
-    """Pause all cpu_contention clients that are currently active, on behalf
+async def preempt_cpu_contention_clients(blocker_lease_id: str, blocker_client: str, config: dict) -> list[str]:
+    """Preempt all cpu_contention clients that are currently active, on behalf
     of a newly granted blocker lease. Best-effort: failures are logged, not
     fatal. Returns the list of client names successfully enrolled in the
-    pause ledger for this blocker.
+    preemption ledger for this blocker.
 
-    Ref-counting: if a client is already paused by another blocker, we add
-    ourselves as an additional blocker and skip the shell pause call.
+    Branches per client:
+      - `heavy_ram: true` (and feature flag on, config valid) → `stop_command`
+        releases the client's RSS while the blocker runs. Restart is scheduled
+        lazily by the lifecycle router on cooldown (WP-102-02).
+      - otherwise → legacy `pause_command` path, container stays resident.
+
+    Ref-counting: if a client has already been preempted by an earlier blocker
+    (stopped/restarting), we enrol ourselves on the blocker ledger and skip
+    the shell action. The legacy paused-branch likewise defers to
+    `_is_currently_paused` for its own ref-count path.
     """
     clients_cfg = config.get("clients", {})
     candidates = _cpu_contention_candidates(config)
     enrolled: list[str] = []
 
-    # Don't pause ourselves.
+    # Don't preempt ourselves.
     candidates = [c for c in candidates if c != blocker_client]
 
     # Ensure the ledger entry exists even if no candidates — keeps release logic simple.
@@ -390,6 +398,65 @@ async def pause_cpu_contention_clients(blocker_lease_id: str, blocker_client: st
 
     for name in candidates:
         cfg = clients_cfg.get(name, {})
+
+        # Skip if already preempted by an earlier blocker (e.g. a concurrent lease).
+        # Only the stop/restart heavy-ram states short-circuit here; the light
+        # (paused) path handles its own ref-count via `_is_currently_paused` below.
+        existing_state = preempted_state.get(name)
+        if existing_state in ("stopped", "restarting"):
+            paused_by[blocker_lease_id].add(name)
+            enrolled.append(name)
+            _log_preemption(
+                action="stop_refcount" if existing_state == "stopped" else "pause_refcount",
+                client=name,
+                reason=f"already {existing_state}, adding blocker={blocker_client}",
+                lease_id=blocker_lease_id,
+            )
+            continue
+
+        if cfg.get("heavy_ram") and HEAVY_RAM_PREEMPTION_ENABLED and not cfg.get("_heavy_ram_invalid"):
+            # HEAVY path: stop the container, release its RAM.
+            stop_cmd = cfg.get("stop_command")
+            if not stop_cmd:
+                print(f"[GPU-MGR] Skipping {name}: heavy_ram flagged but no stop_command")
+                continue
+            try:
+                rc, _out, err = await _run_shell(stop_cmd, timeout=10.0)
+                if rc == 0:
+                    preempted_state[name] = "stopped"
+                    preempted_since[name] = time.time()
+                    paused_by[blocker_lease_id].add(name)
+                    enrolled.append(name)
+                    _log_preemption(
+                        action="stop",
+                        client=name,
+                        reason=f"heavy_ram, blocker={blocker_client}",
+                        lease_id=blocker_lease_id,
+                    )
+                else:
+                    _log_preemption(
+                        action="stop_failed",
+                        client=name,
+                        reason=f"rc={rc} stderr={err.strip()[:120]}",
+                        lease_id=blocker_lease_id,
+                    )
+            except asyncio.TimeoutError:
+                _log_preemption(
+                    action="stop_failed",
+                    client=name,
+                    reason="timeout",
+                    lease_id=blocker_lease_id,
+                )
+            except Exception as e:  # noqa: BLE001 — best-effort preemption
+                _log_preemption(
+                    action="stop_failed",
+                    client=name,
+                    reason=f"exception={e}",
+                    lease_id=blocker_lease_id,
+                )
+            continue
+
+        # LIGHT path: existing pause_command behaviour.
         pause_cmd = cfg.get("pause_command")
         if not pause_cmd:
             print(f"[GPU-MGR] Skipping {name}: cpu_contention flagged but no pause_command")
@@ -410,6 +477,8 @@ async def pause_cpu_contention_clients(blocker_lease_id: str, blocker_client: st
         try:
             rc, _out, err = await _run_shell(pause_cmd, timeout=5.0)
             if rc == 0:
+                preempted_state[name] = "paused"
+                preempted_since[name] = time.time()
                 paused_by[blocker_lease_id].add(name)
                 enrolled.append(name)
                 _log_preemption(
@@ -441,6 +510,12 @@ async def pause_cpu_contention_clients(blocker_lease_id: str, blocker_client: st
             )
 
     return enrolled
+
+
+# Backwards-compat alias. The old name is still referenced by existing tests
+# (test_cpu_contention.py) and potentially external tooling; the behaviour is
+# unchanged for non-heavy_ram clients.
+pause_cpu_contention_clients = preempt_cpu_contention_clients
 
 
 async def unpause_for_released_lease(lease_id: str, config: dict) -> list[str]:
@@ -973,9 +1048,9 @@ async def acquire_lease(req: AcquireRequest):
     req_priority = PRIORITY_ORDER.get(req.priority, 2)
     if req_priority <= CPU_CONTENTION_PRIORITY_THRESHOLD:
         try:
-            paused = await pause_cpu_contention_clients(lease_id, req.client, config)
+            paused = await preempt_cpu_contention_clients(lease_id, req.client, config)
         except Exception as e:
-            print(f"[GPU-MGR] pause_cpu_contention_clients error: {e}")
+            print(f"[GPU-MGR] preempt_cpu_contention_clients error: {e}")
 
     # Write model env file if model specified and client supports it
     if req.model:

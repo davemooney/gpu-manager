@@ -394,3 +394,343 @@ class TestRestartScheduler:
             e.get("action") == "start_failed" and e.get("client") == "x"
             for e in gm.preemption_log
         )
+
+
+# ---------------------------------------------------------------------------
+# WP-102-03: preempt_cpu_contention_clients dispatcher (stop-or-pause branch)
+# ---------------------------------------------------------------------------
+
+
+class TestPreemptDispatcher:
+    """Branch tests for `preempt_cpu_contention_clients`: heavy_ram clients
+    get `stop_command`, plain cpu_contention clients keep the legacy pause
+    path, and already-preempted clients ref-count without re-firing shell.
+    """
+
+    @pytest.mark.asyncio
+    async def test_heavy_client_gets_stopped(self, clean_state, monkeypatch, write_config):
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+        calls: list[str] = []
+
+        async def fake_shell(cmd, timeout=5.0):
+            calls.append(cmd)
+            return (0, "", "")
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        write_config({
+            "clients": {
+                "vllm": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    "heavy_ram": True,
+                    "start_command": "launch",
+                    "stop_command": "docker stop vllm",
+                    "pause_command": "docker pause vllm",
+                    "unpause_command": "docker unpause vllm",
+                }
+            }
+        })
+        config = gm.load_config()
+        await gm.preempt_cpu_contention_clients("lease-abc", "forma-avatar", config)
+
+        assert any("docker stop vllm" in c for c in calls)
+        # Should NOT have issued a pause — heavy path took over.
+        assert not any("docker pause vllm" in c for c in calls)
+        assert gm.preempted_state["vllm"] == "stopped"
+        assert "vllm" in gm.preempted_since
+        assert "vllm" in gm.paused_by["lease-abc"]
+        # Preemption log records a `stop` action for the client.
+        assert any(
+            e.get("action") == "stop" and e.get("client") == "vllm"
+            for e in gm.preemption_log
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_heavy_client_gets_paused(self, clean_state, monkeypatch, write_config):
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+        calls: list[str] = []
+
+        async def fake_shell(cmd, timeout=5.0):
+            calls.append(cmd)
+            return (0, "", "")
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        write_config({
+            "clients": {
+                "lite": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    "pause_command": "docker pause lite",
+                    "unpause_command": "docker unpause lite",
+                    "stop_command": "docker stop lite",
+                }
+            }
+        })
+        config = gm.load_config()
+        await gm.preempt_cpu_contention_clients("lease-abc", "forma-avatar", config)
+
+        assert any("docker pause lite" in c for c in calls)
+        assert not any("docker stop lite" in c for c in calls)
+        assert gm.preempted_state["lite"] == "paused"
+        assert "lite" in gm.preempted_since
+        assert "lite" in gm.paused_by["lease-abc"]
+
+    @pytest.mark.asyncio
+    async def test_already_stopped_skips_action(self, clean_state, monkeypatch, write_config):
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+        calls: list[str] = []
+
+        async def fake_shell(cmd, timeout=5.0):
+            calls.append(cmd)
+            return (0, "", "")
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        write_config({
+            "clients": {
+                "vllm": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    "heavy_ram": True,
+                    "start_command": "launch",
+                    "stop_command": "docker stop vllm",
+                }
+            }
+        })
+        config = gm.load_config()
+        gm.preempted_state["vllm"] = "stopped"  # pre-existing blocker
+
+        await gm.preempt_cpu_contention_clients("lease-xyz", "forma-avatar", config)
+
+        assert calls == []  # no shell called — short-circuited on pre-existing state
+        assert "vllm" in gm.paused_by["lease-xyz"]
+        # And preemption_log records stop_refcount for the ref-count path.
+        assert any(
+            e.get("action") == "stop_refcount" and e.get("client") == "vllm"
+            for e in gm.preemption_log
+        )
+
+    @pytest.mark.asyncio
+    async def test_already_restarting_skips_action(self, clean_state, monkeypatch, write_config):
+        """A client currently in the `restarting` window (cooldown→restart
+        coalesce) also short-circuits — we still want to enrol the new
+        blocker so it can cancel the restart on its next release."""
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+        calls: list[str] = []
+
+        async def fake_shell(cmd, timeout=5.0):
+            calls.append(cmd)
+            return (0, "", "")
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        write_config({
+            "clients": {
+                "vllm": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    "heavy_ram": True,
+                    "start_command": "launch",
+                    "stop_command": "docker stop vllm",
+                }
+            }
+        })
+        config = gm.load_config()
+        gm.preempted_state["vllm"] = "restarting"
+
+        await gm.preempt_cpu_contention_clients("lease-new", "forma-avatar", config)
+
+        assert calls == []
+        assert "vllm" in gm.paused_by["lease-new"]
+        assert any(
+            e.get("action") == "pause_refcount" and e.get("client") == "vllm"
+            for e in gm.preemption_log
+        )
+
+    @pytest.mark.asyncio
+    async def test_mixed_heavy_and_light(self, clean_state, monkeypatch, write_config):
+        """Config with both a heavy_ram and a plain cpu_contention client:
+        each takes its own branch — heavy gets stopped, light gets paused."""
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+        calls: list[str] = []
+
+        async def fake_shell(cmd, timeout=5.0):
+            calls.append(cmd)
+            return (0, "", "")
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        write_config({
+            "clients": {
+                "vllm": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    "heavy_ram": True,
+                    "start_command": "launch",
+                    "stop_command": "docker stop vllm",
+                    "pause_command": "docker pause vllm",
+                },
+                "sglang-vision": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    # No heavy_ram flag — pure light path.
+                    "pause_command": "docker pause sglang-vision",
+                    "unpause_command": "docker unpause sglang-vision",
+                    "stop_command": "docker stop sglang-vision",
+                },
+            }
+        })
+        config = gm.load_config()
+        await gm.preempt_cpu_contention_clients("lease-mix", "forma-avatar", config)
+
+        # Heavy path hit stop, light path hit pause — no cross-contamination.
+        assert any("docker stop vllm" in c for c in calls)
+        assert any("docker pause sglang-vision" in c for c in calls)
+        assert not any("docker pause vllm" in c for c in calls)
+        assert not any("docker stop sglang-vision" in c for c in calls)
+
+        assert gm.preempted_state["vllm"] == "stopped"
+        assert gm.preempted_state["sglang-vision"] == "paused"
+        assert {"vllm", "sglang-vision"} <= gm.paused_by["lease-mix"]
+
+    @pytest.mark.asyncio
+    async def test_feature_flag_off_falls_back_to_pause_for_heavy(
+        self, clean_state, monkeypatch, write_config
+    ):
+        """Flag OFF + heavy_ram=True client should take the LIGHT path
+        (pause) so operators can instantly roll back without a code change."""
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", False)
+        calls: list[str] = []
+
+        async def fake_shell(cmd, timeout=5.0):
+            calls.append(cmd)
+            return (0, "", "")
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        write_config({
+            "clients": {
+                "vllm": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    "heavy_ram": True,
+                    "start_command": "launch",
+                    "stop_command": "docker stop vllm",
+                    "pause_command": "docker pause vllm",
+                    "unpause_command": "docker unpause vllm",
+                }
+            }
+        })
+        config = gm.load_config()
+        await gm.preempt_cpu_contention_clients("lease-flag-off", "forma-avatar", config)
+
+        # With flag OFF the heavy branch is skipped; LIGHT path fires pause.
+        assert any("docker pause vllm" in c for c in calls)
+        assert not any("docker stop vllm" in c for c in calls)
+        assert gm.preempted_state["vllm"] == "paused"
+        assert "vllm" in gm.paused_by["lease-flag-off"]
+
+    @pytest.mark.asyncio
+    async def test_heavy_invalid_config_skipped_not_crashed(
+        self, clean_state, monkeypatch, write_config
+    ):
+        """A heavy_ram client missing a start_command is flagged invalid at
+        config load and must NOT be stopped — preempt_cpu_contention_clients
+        skips it entirely (no shell, no ledger entry)."""
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+        calls: list[str] = []
+
+        async def fake_shell(cmd, timeout=5.0):
+            calls.append(cmd)
+            return (0, "", "")
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        write_config({
+            "clients": {
+                "broken": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    "heavy_ram": True,
+                    # No start_command — load_config sets _heavy_ram_invalid.
+                    "stop_command": "docker stop broken",
+                    "pause_command": "docker pause broken",
+                }
+            }
+        })
+        config = gm.load_config()
+        assert config["clients"]["broken"]["_heavy_ram_invalid"]
+
+        await gm.preempt_cpu_contention_clients("lease-bad", "forma-avatar", config)
+
+        # Heavy branch is gated out; LIGHT branch still runs pause_command.
+        # The invariant we MUST preserve is: no `docker stop broken` fires, so
+        # we don't strand a client with no way to restart.
+        assert not any("docker stop broken" in c for c in calls)
+        # Light fallback still paused it (preserves forward progress).
+        assert any("docker pause broken" in c for c in calls)
+        assert gm.preempted_state.get("broken") == "paused"
+
+    @pytest.mark.asyncio
+    async def test_heavy_stop_failure_is_best_effort(
+        self, clean_state, monkeypatch, write_config
+    ):
+        """A failing stop_command must not crash the dispatcher; the client
+        is NOT enrolled on the blocker (nothing to reverse later), and the
+        failure is recorded in preemption_log."""
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+
+        async def failing_shell(cmd, timeout=5.0):
+            return (1, "", "Error: no such container")
+
+        monkeypatch.setattr(gm, "_run_shell", failing_shell)
+        write_config({
+            "clients": {
+                "vllm": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    "heavy_ram": True,
+                    "start_command": "launch",
+                    "stop_command": "docker stop vllm",
+                }
+            }
+        })
+        config = gm.load_config()
+        await gm.preempt_cpu_contention_clients("lease-fail", "forma-avatar", config)
+
+        # State left clean: nothing recorded as stopped, no ledger entry.
+        assert "vllm" not in gm.preempted_state
+        assert "vllm" not in gm.paused_by.get("lease-fail", set())
+        # But the failure was recorded.
+        assert any(
+            e.get("action") == "stop_failed" and e.get("client") == "vllm"
+            for e in gm.preemption_log
+        )
+
+    @pytest.mark.asyncio
+    async def test_blocker_client_skipped_even_if_cpu_contention(
+        self, clean_state, monkeypatch, write_config
+    ):
+        """The blocker itself must not be preempted even if it's flagged
+        cpu_contention — protects against self-preemption."""
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+        calls: list[str] = []
+
+        async def fake_shell(cmd, timeout=5.0):
+            calls.append(cmd)
+            return (0, "", "")
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        write_config({
+            "clients": {
+                "vllm": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    "heavy_ram": True,
+                    "start_command": "launch",
+                    "stop_command": "docker stop vllm",
+                    "pause_command": "docker pause vllm",
+                },
+            }
+        })
+        config = gm.load_config()
+        await gm.preempt_cpu_contention_clients("lease-self", "vllm", config)
+
+        assert calls == []
+        assert "vllm" not in gm.preempted_state
+        assert gm.paused_by.get("lease-self", set()) == set()
