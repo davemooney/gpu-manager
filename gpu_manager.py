@@ -518,72 +518,124 @@ async def preempt_cpu_contention_clients(blocker_lease_id: str, blocker_client: 
 pause_cpu_contention_clients = preempt_cpu_contention_clients
 
 
-async def unpause_for_released_lease(lease_id: str, config: dict) -> list[str]:
-    """Remove a blocker from the pause ledger. For each client it was holding,
-    if no other blocker remains, issue unpause_command. Returns the list of
-    client names actually unpaused (not including still-held-by-another)."""
+async def unpause_or_restart_for_released_lease(lease_id: str, config: dict) -> list[str]:
+    """Remove a blocker from the pause ledger. For each client it held:
+      - if another blocker still holds it → leave it preempted
+      - elif preempted_state[name] == "stopped" → schedule_restart(name) with
+        coalesce window; set state "restarting"
+      - elif preempted_state[name] == "paused" → issue unpause_command;
+        clear state
+
+    Returns the list of client names for which an action (restart schedule
+    or unpause) was successfully initiated. Clients that remain blocked by
+    another lease, or for which no state was tracked, are NOT returned.
+    """
     clients_cfg = config.get("clients", {})
     formerly_held = paused_by.pop(lease_id, set())
-    unpaused: list[str] = []
+    actions: list[str] = []
 
     for name in formerly_held:
-        # If another blocker still holds this client, leave it paused.
-        if _is_currently_paused(name):
+        # Another blocker still holds this client? Leave it preempted.
+        still_blocked = any(
+            name in blockers
+            for other_id, blockers in paused_by.items()
+            if other_id != lease_id
+        )
+        if still_blocked:
             _log_preemption(
-                action="unpause_skipped",
+                action="release_skipped",
                 client=name,
-                reason="another blocker still active",
+                reason="other blocker active",
                 lease_id=lease_id,
             )
             continue
 
-        # Look up the unpause command from the CURRENT config (which may have
-        # been reloaded since the pause fired — that's fine, we just need the
-        # command to run).
-        cfg = clients_cfg.get(name, {})
-        unpause_cmd = cfg.get("unpause_command")
-        if not unpause_cmd:
+        current_state = preempted_state.get(name)
+
+        if current_state == "stopped":
+            # HEAVY path — schedule a debounced restart. `schedule_restart`
+            # is a no-op when HEAVY_RAM_PREEMPTION_ENABLED is False, which
+            # would strand the container stopped. To avoid that footgun we
+            # check the flag here and fall through to the (no-op) call only
+            # when it's on; a flipped flag leaves us with a state transition
+            # recorded even though no task will fire.
+            schedule_restart(name)  # uses HEAVY_RAM_COALESCE_SECONDS
+            preempted_state[name] = "restarting"
+            preempted_since[name] = time.time()
             _log_preemption(
-                action="unpause_skipped",
+                action="restart_scheduled",
                 client=name,
-                reason="no unpause_command in current config",
+                reason=f"coalesce={HEAVY_RAM_COALESCE_SECONDS}s",
                 lease_id=lease_id,
             )
+            actions.append(name)
             continue
 
-        try:
-            rc, _out, err = await _run_shell(unpause_cmd, timeout=5.0)
-            if rc == 0:
-                unpaused.append(name)
+        if current_state == "paused":
+            # LIGHT path — unpause immediately from the CURRENT config (which
+            # may have been reloaded since the pause fired — that's fine, we
+            # just need the command to run).
+            cfg = clients_cfg.get(name, {})
+            unpause_cmd = cfg.get("unpause_command")
+            if not unpause_cmd:
                 _log_preemption(
-                    action="unpause",
+                    action="unpause_skipped",
                     client=name,
-                    reason="last blocker released",
+                    reason="no unpause_command in current config",
                     lease_id=lease_id,
                 )
-            else:
+                continue
+            try:
+                rc, _out, err = await _run_shell(unpause_cmd, timeout=5.0)
+                if rc == 0:
+                    preempted_state.pop(name, None)
+                    preempted_since.pop(name, None)
+                    actions.append(name)
+                    _log_preemption(
+                        action="unpause",
+                        client=name,
+                        reason=unpause_cmd[:80],
+                        lease_id=lease_id,
+                    )
+                else:
+                    _log_preemption(
+                        action="unpause_failed",
+                        client=name,
+                        reason=f"rc={rc} stderr={err.strip()[:120]}",
+                        lease_id=lease_id,
+                    )
+            except asyncio.TimeoutError:
                 _log_preemption(
                     action="unpause_failed",
                     client=name,
-                    reason=f"rc={rc} stderr={err.strip()[:120]}",
+                    reason="timeout",
                     lease_id=lease_id,
                 )
-        except asyncio.TimeoutError:
-            _log_preemption(
-                action="unpause_failed",
-                client=name,
-                reason="timeout",
-                lease_id=lease_id,
-            )
-        except Exception as e:
-            _log_preemption(
-                action="unpause_failed",
-                client=name,
-                reason=f"exception={e}",
-                lease_id=lease_id,
-            )
+            except Exception as e:  # noqa: BLE001 — best-effort release
+                _log_preemption(
+                    action="unpause_failed",
+                    client=name,
+                    reason=f"exception={e}",
+                    lease_id=lease_id,
+                )
+            continue
 
-    return unpaused
+        # No tracked state (e.g. stop_command failed at preempt-time, or the
+        # state was cleared by a concurrent restart task). Nothing to reverse.
+        _log_preemption(
+            action="release_skipped",
+            client=name,
+            reason=f"no tracked state (current={current_state!r})",
+            lease_id=lease_id,
+        )
+
+    return actions
+
+
+# Backwards-compat alias. The old name is still referenced by legacy tests
+# (test_cpu_contention.py) and potentially external tooling. The new name
+# preserves the previous LIGHT-path behaviour for cpu_contention clients.
+unpause_for_released_lease = unpause_or_restart_for_released_lease
 
 
 async def boot_time_unpause_sweep(config: dict) -> None:
@@ -989,7 +1041,7 @@ async def acquire_lease(req: AcquireRequest):
             stop_service(lease.client, config)
             del active_leases[lid]
             # Also release any pause ledger entry held by the preempted lease.
-            await unpause_for_released_lease(lid, config)
+            await unpause_or_restart_for_released_lease(lid, config)
             preempted.append(lease.client)
             # Wait briefly for VRAM to free
             await asyncio.sleep(2)
@@ -1104,8 +1156,8 @@ async def release_lease(req: ReleaseRequest):
     config = load_config()
     stop_service(lease.client, config)
 
-    # Unpause any cpu_contention clients that were being held paused by this lease.
-    unpaused = await unpause_for_released_lease(req.lease_id, config)
+    # Unpause/restart any cpu_contention clients held by this lease.
+    unpaused = await unpause_or_restart_for_released_lease(req.lease_id, config)
 
     return {
         "status": "released",
@@ -1133,10 +1185,10 @@ async def release_by_client(client_name: str):
     config = load_config()
     stop_service(client_name, config)
 
-    # Unpause any cpu_contention clients that were being held paused by these leases.
+    # Unpause/restart any cpu_contention clients that were held paused/stopped by these leases.
     all_unpaused: list[str] = []
     for lid in released:
-        all_unpaused.extend(await unpause_for_released_lease(lid, config))
+        all_unpaused.extend(await unpause_or_restart_for_released_lease(lid, config))
 
     return {"status": "released", "leases": released, "unpaused": all_unpaused}
 
@@ -1324,6 +1376,11 @@ async def _pause_for_lifecycle(
         try:
             rc, _out, err = await _run_shell(pause_cmd, timeout=5.0)
             if rc == 0:
+                # Maintain preempted_state invariant so the release dispatcher
+                # knows to issue an unpause on ref-count zero. Without this the
+                # state would be untracked and the release would be skipped.
+                preempted_state[name] = "paused"
+                preempted_since[name] = time.time()
                 paused_by[blocker_key].add(name)
                 enrolled.append(name)
                 _log_preemption(
@@ -1358,10 +1415,11 @@ async def _pause_for_lifecycle(
 
 
 async def _unpause_for_lifecycle(source_client: str, config: dict) -> list[str]:
-    """Release the synthetic lifecycle blocker and unpause any clients whose
-    ref-count hits zero. Reuses the exact same unpause path as real leases."""
+    """Release the synthetic lifecycle blocker and unpause/restart any clients
+    whose ref-count hits zero. Reuses the exact same release path as real leases.
+    """
     blocker_key = _lifecycle_blocker_key(source_client)
-    return await unpause_for_released_lease(blocker_key, config)
+    return await unpause_or_restart_for_released_lease(blocker_key, config)
 
 
 @app.post("/lifecycle/{source_client}")

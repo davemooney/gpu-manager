@@ -734,3 +734,321 @@ class TestPreemptDispatcher:
         assert calls == []
         assert "vllm" not in gm.preempted_state
         assert gm.paused_by.get("lease-self", set()) == set()
+
+
+# ---------------------------------------------------------------------------
+# WP-102-04: unpause_or_restart_for_released_lease dispatcher
+# ---------------------------------------------------------------------------
+
+
+class TestReleaseDispatcher:
+    """Branch tests for `unpause_or_restart_for_released_lease`.
+
+    Reverses whatever `preempt_cpu_contention_clients` did per-client:
+    heavy stopped → schedule_restart; light paused → unpause; overlapping
+    blockers → leave preempted until ref-count hits zero.
+    """
+
+    @pytest.mark.asyncio
+    async def test_heavy_release_schedules_restart(
+        self, clean_state, _clean_restart_tasks, monkeypatch, write_config
+    ):
+        """preempted_state == 'stopped' → schedule_restart + state 'restarting'."""
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+
+        scheduled: list[str] = []
+
+        def fake_schedule_restart(name, delay_s=None):
+            scheduled.append(name)
+
+        monkeypatch.setattr(gm, "schedule_restart", fake_schedule_restart)
+
+        write_config({
+            "clients": {
+                "vllm": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    "heavy_ram": True,
+                    "start_command": "launch",
+                    "stop_command": "docker stop vllm",
+                    "pause_command": "docker pause vllm",
+                    "unpause_command": "docker unpause vllm",
+                }
+            }
+        })
+        config = gm.load_config()
+
+        # Simulate a prior preempt having stopped the client.
+        gm.preempted_state["vllm"] = "stopped"
+        gm.preempted_since["vllm"] = 1.0
+        gm.paused_by["lease-heavy"] = {"vllm"}
+
+        actions = await gm.unpause_or_restart_for_released_lease("lease-heavy", config)
+
+        assert actions == ["vllm"]
+        assert scheduled == ["vllm"]
+        assert gm.preempted_state["vllm"] == "restarting"
+        assert "vllm" in gm.preempted_since
+        # Ledger entry cleared.
+        assert "lease-heavy" not in gm.paused_by
+        assert any(
+            e.get("action") == "restart_scheduled" and e.get("client") == "vllm"
+            for e in gm.preemption_log
+        )
+
+    @pytest.mark.asyncio
+    async def test_light_release_unpauses(
+        self, clean_state, _clean_restart_tasks, monkeypatch, write_config
+    ):
+        """preempted_state == 'paused' → unpause_command runs, state cleared."""
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+        calls: list[str] = []
+
+        async def fake_shell(cmd, timeout=5.0):
+            calls.append(cmd)
+            return (0, "", "")
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        write_config({
+            "clients": {
+                "lite": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    "pause_command": "docker pause lite",
+                    "unpause_command": "docker unpause lite",
+                }
+            }
+        })
+        config = gm.load_config()
+
+        gm.preempted_state["lite"] = "paused"
+        gm.preempted_since["lite"] = 1.0
+        gm.paused_by["lease-light"] = {"lite"}
+
+        actions = await gm.unpause_or_restart_for_released_lease("lease-light", config)
+
+        assert actions == ["lite"]
+        assert any("docker unpause lite" in c for c in calls)
+        assert "lite" not in gm.preempted_state
+        assert "lite" not in gm.preempted_since
+        assert "lease-light" not in gm.paused_by
+        assert any(
+            e.get("action") == "unpause" and e.get("client") == "lite"
+            for e in gm.preemption_log
+        )
+
+    @pytest.mark.asyncio
+    async def test_overlapping_blockers_keeps_client_preempted(
+        self, clean_state, _clean_restart_tasks, monkeypatch, write_config
+    ):
+        """Two leases both hold the same client; releasing one must leave the
+        client preempted (no shell call, state untouched)."""
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+        calls: list[str] = []
+
+        async def fake_shell(cmd, timeout=5.0):
+            calls.append(cmd)
+            return (0, "", "")
+
+        scheduled: list[str] = []
+
+        def fake_schedule_restart(name, delay_s=None):
+            scheduled.append(name)
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        monkeypatch.setattr(gm, "schedule_restart", fake_schedule_restart)
+
+        write_config({
+            "clients": {
+                "vllm": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    "heavy_ram": True,
+                    "start_command": "launch",
+                    "stop_command": "docker stop vllm",
+                    "unpause_command": "docker unpause vllm",
+                },
+                "lite": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    "pause_command": "docker pause lite",
+                    "unpause_command": "docker unpause lite",
+                },
+            }
+        })
+        config = gm.load_config()
+
+        # Heavy client stopped, light client paused, both under two blockers.
+        gm.preempted_state["vllm"] = "stopped"
+        gm.preempted_since["vllm"] = 1.0
+        gm.preempted_state["lite"] = "paused"
+        gm.preempted_since["lite"] = 1.0
+        gm.paused_by["lease-A"] = {"vllm", "lite"}
+        gm.paused_by["lease-B"] = {"vllm", "lite"}
+
+        # Release the first lease — the other still holds both clients.
+        actions = await gm.unpause_or_restart_for_released_lease("lease-A", config)
+
+        assert actions == []  # nothing reversed
+        assert scheduled == []  # no restart fired
+        assert not any("docker unpause" in c for c in calls)  # no unpause fired
+        # State preserved.
+        assert gm.preempted_state["vllm"] == "stopped"
+        assert gm.preempted_state["lite"] == "paused"
+        # Ledger: A cleared, B retains both.
+        assert "lease-A" not in gm.paused_by
+        assert gm.paused_by["lease-B"] == {"vllm", "lite"}
+        # release_skipped logged for each.
+        skip_clients = {
+            e["client"] for e in gm.preemption_log
+            if e.get("action") == "release_skipped"
+        }
+        assert {"vllm", "lite"} <= skip_clients
+
+    @pytest.mark.asyncio
+    async def test_mixed_blockers_real_lease_plus_lifecycle(
+        self, clean_state, _clean_restart_tasks, monkeypatch, write_config
+    ):
+        """Real lease + lifecycle blocker both active; release lease leaves
+        client held by lifecycle; release lifecycle → unpause fires."""
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+        calls: list[str] = []
+
+        async def fake_shell(cmd, timeout=5.0):
+            calls.append(cmd)
+            return (0, "", "")
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        write_config({
+            "clients": {
+                "lite": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    "pause_command": "docker pause lite",
+                    "unpause_command": "docker unpause lite",
+                }
+            }
+        })
+        config = gm.load_config()
+
+        gm.preempted_state["lite"] = "paused"
+        gm.preempted_since["lite"] = 1.0
+        # Real lease blocker + synthetic lifecycle blocker.
+        lifecycle_key = gm._lifecycle_blocker_key("forma-avatar")
+        gm.paused_by["lease-real"] = {"lite"}
+        gm.paused_by[lifecycle_key] = {"lite"}
+
+        # Release the real lease first — lifecycle still holds it.
+        actions_1 = await gm.unpause_or_restart_for_released_lease(
+            "lease-real", config
+        )
+        assert actions_1 == []
+        assert not any("docker unpause" in c for c in calls)
+        assert gm.preempted_state.get("lite") == "paused"
+
+        # Release the lifecycle blocker — now unpause fires.
+        actions_2 = await gm.unpause_or_restart_for_released_lease(
+            lifecycle_key, config
+        )
+        assert actions_2 == ["lite"]
+        assert any("docker unpause lite" in c for c in calls)
+        assert "lite" not in gm.preempted_state
+        assert "lite" not in gm.preempted_since
+
+    @pytest.mark.asyncio
+    async def test_config_reload_between_preempt_and_release_uses_current_cmd(
+        self, clean_state, _clean_restart_tasks, monkeypatch, write_config
+    ):
+        """Preempt with cmd_v1, reload cmd_v2, release → uses cmd_v2.
+
+        The release dispatcher always looks the unpause_command up from the
+        config it's passed, not any cached value captured at preempt-time.
+        """
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", True)
+        calls: list[str] = []
+
+        async def fake_shell(cmd, timeout=5.0):
+            calls.append(cmd)
+            return (0, "", "")
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+
+        # v1 config at preempt time (not actually used for unpause — the
+        # dispatcher uses whatever config is passed in at release time).
+        write_config({
+            "clients": {
+                "lite": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    "pause_command": "docker pause lite",
+                    "unpause_command": "docker unpause lite --v1",
+                }
+            }
+        })
+
+        # Simulate prior preempt state.
+        gm.preempted_state["lite"] = "paused"
+        gm.preempted_since["lite"] = 1.0
+        gm.paused_by["lease-reload"] = {"lite"}
+
+        # Reload config to v2 with a different unpause_command.
+        write_config({
+            "clients": {
+                "lite": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    "pause_command": "docker pause lite",
+                    "unpause_command": "docker unpause lite --v2",
+                }
+            }
+        })
+        config_v2 = gm.load_config()
+
+        actions = await gm.unpause_or_restart_for_released_lease(
+            "lease-reload", config_v2
+        )
+
+        assert actions == ["lite"]
+        # v2 command ran, v1 did not.
+        assert any("--v2" in c for c in calls)
+        assert not any("--v1" in c for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_feature_flag_off_still_unpauses_light_clients(
+        self, clean_state, _clean_restart_tasks, monkeypatch, write_config
+    ):
+        """With HEAVY_RAM_PREEMPTION_ENABLED=False, light (paused) clients
+        still unpause on release — roll-back safety."""
+        monkeypatch.setattr(gm, "HEAVY_RAM_PREEMPTION_ENABLED", False)
+        calls: list[str] = []
+
+        async def fake_shell(cmd, timeout=5.0):
+            calls.append(cmd)
+            return (0, "", "")
+
+        monkeypatch.setattr(gm, "_run_shell", fake_shell)
+        write_config({
+            "clients": {
+                "lite": {
+                    "cpu_contention": True,
+                    "preemptible": True,
+                    "pause_command": "docker pause lite",
+                    "unpause_command": "docker unpause lite",
+                }
+            }
+        })
+        config = gm.load_config()
+
+        gm.preempted_state["lite"] = "paused"
+        gm.preempted_since["lite"] = 1.0
+        gm.paused_by["lease-flag-off"] = {"lite"}
+
+        actions = await gm.unpause_or_restart_for_released_lease(
+            "lease-flag-off", config
+        )
+
+        assert actions == ["lite"]
+        assert any("docker unpause lite" in c for c in calls)
+        assert "lite" not in gm.preempted_state
+        assert "lite" not in gm.preempted_since
+        assert "lease-flag-off" not in gm.paused_by
