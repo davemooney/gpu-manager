@@ -134,6 +134,80 @@ flow through the same unpause path in `unpause_for_released_lease`, so a
 client paused by BOTH a normal lease AND a lifecycle `generating` signal
 stays paused until BOTH blockers clear.
 
+## heavy_ram flag (davemooney/avatar#102)
+
+### Motivation
+
+Tier 2's `docker pause` freezes CPU but leaves the container's RAM resident.
+On RAM-pressured hosts (e.g. aidin, 62 GB RAM, carrying sglang-llm ~8 GB +
+sglang-vision ~7 GB alongside forma-avatar's ~23 GB Flux `cpu_offload`), the
+pause-only approach still saturates RAM and can OOM-kill higher-priority
+workloads mid-generate. `heavy_ram: true` triggers a full `docker stop` on
+preemption (releases the container's RAM) and a debounced `docker start` on
+release.
+
+### `clients.yaml` schema extension
+
+| Field       | Type | Required | Description |
+| ----------- | ---- | -------- | ----------- |
+| `heavy_ram` | bool | no (**NEW**) | if true, preemption issues `stop_command` instead of `pause_command` and schedules a coalesced restart on release. Defaults to `false`. |
+
+**When to set.** Clients that hold significant RAM AND are preemptible AND
+have `start_command` defined. Today that means `vllm` and `sglang-vision`.
+
+**Interaction with `cpu_contention`.** `heavy_ram: true` requires
+`cpu_contention: true`. The preempt dispatcher first checks `cpu_contention`
+to decide whether the client is eligible, then branches on `heavy_ram` to
+choose stop-vs-pause.
+
+**Interaction with `keepalive: true`.** Orthogonal. `keepalive` exempts a
+client from the watchdog's "stop when idle" loop; `heavy_ram` controls the
+preemption action verb. A client can set both (the common case for
+`vllm` / `sglang-vision`).
+
+### Behaviour
+
+- **On lifecycle `generating`** (or any lease acquire at
+  `priority >= normal`): `heavy_ram: true` clients get `stop_command`
+  issued, and `preempted_state[name] = "stopped"`.
+- **On lifecycle `cooldown`** (or lease release): `heavy_ram` clients get
+  a `schedule_restart` with a coalesce window (default 60 s). Rapid-fire
+  generates cancel the pending restart, so back-to-back sessions incur one
+  stop at the start and one start after sustained idle.
+- **On startup (boot sweep)**: any `heavy_ram` client that fails its
+  `health_check` is automatically restarted. This recovers from a manager
+  crash that stranded the stop.
+
+### Configuration
+
+| Env var | Default | Purpose |
+| ------- | ------- | ------- |
+| `HEAVY_RAM_PREEMPTION_ENABLED` | `true` | master switch; set to `false` to revert to pure-pause behaviour instantly |
+| `HEAVY_RAM_COALESCE_SECONDS`   | `60`   | debounce window before a stopped client is restarted after cooldown |
+
+### Rollback
+
+If the feature misbehaves, drop to pure-pause with no redeploy:
+
+```
+# On the aidin systemd unit for gpu-manager
+sudo systemctl edit gpu-manager.service
+# Add:
+[Service]
+Environment="HEAVY_RAM_PREEMPTION_ENABLED=false"
+# Save, then:
+sudo systemctl restart gpu-manager.service
+```
+
+Immediately reverts to Tier 2 pure-pause.
+
+### Linked issues
+
+- [`davemooney/avatar#102`](https://github.com/davemooney/avatar/issues/102) —
+  the original issue
+- Depends on Tier 2 (`cpu_contention`) and Tier 3 (lifecycle callback
+  protocol) already documented above
+
 ## Deploying on aidin
 
 Place this repo at `/home/aidin/gpu-manager/` and manage via systemd:
