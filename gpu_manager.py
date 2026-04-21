@@ -72,6 +72,12 @@ HEAVY_RAM_PREEMPTION_ENABLED = os.environ.get(
     "HEAVY_RAM_PREEMPTION_ENABLED", "true"
 ).strip().lower() == "true"
 
+# Coalesce window (seconds) for heavy_ram restart scheduling. A cooldown event
+# schedules the restart this far in the future; a subsequent `generating` event
+# within the window cancels the pending restart so we don't thrash the cold
+# start cycle on back-to-back generates. Tunable per-deployment.
+HEAVY_RAM_COALESCE_SECONDS = int(os.environ.get("HEAVY_RAM_COALESCE_SECONDS", "60"))
+
 PRIORITY_ORDER = {"critical": 0, "high": 1, "normal": 2, "idle": 3}
 
 # Threshold at which we pause cpu_contention clients. normal (2) and tighter
@@ -159,6 +165,13 @@ preempted_state: dict[str, str] = {}
 # Parallel map recording when the state transitioned. Used by /clients/{name}/state
 # to report `since_seconds`.
 preempted_since: dict[str, float] = {}
+
+# Per-client asyncio Task handles for coalesced restarts.
+# Key = client name; value = the currently-scheduled restart task.
+# Scheduling a new restart for a client cancels any existing pending task,
+# so rapid-fire cooldown→generating→cooldown sequences collapse to a single
+# eventual restart at the trailing edge of the burst.
+restart_tasks: dict[str, "asyncio.Task"] = {}
 
 # In-memory audit log of preemption actions. Oldest first, newest last.
 preemption_log: deque = deque(maxlen=PREEMPTION_LOG_MAX)
@@ -542,6 +555,132 @@ async def boot_time_unpause_sweep(config: dict) -> None:
                 reason=f"exception={e}",
                 lease_id=None,
             )
+
+
+# ---------------------------------------------------------------------------
+# heavy_ram restart scheduler (davemooney/avatar#102 / WP-102-02)
+# ---------------------------------------------------------------------------
+#
+# Heavy_ram clients get `docker stop`-ed (not just paused) during a generate,
+# which releases their ~15 GB RSS back to the host. On cooldown we don't want
+# to start them back up immediately — if the user fires another generate
+# within ~60 s, we'd thrash the cold-start cycle. Instead, schedule a delayed
+# restart; a new schedule call cancels the existing pending one (coalesce).
+
+
+def schedule_restart(name: str, delay_s: int | None = None) -> None:
+    """Schedule a heavy_ram client to restart after `delay_s` seconds.
+
+    Cancels any existing pending restart task for this client (coalesce).
+    No-op if HEAVY_RAM_PREEMPTION_ENABLED is False so operators can instantly
+    disable the path via env var without a code change.
+    """
+    if not HEAVY_RAM_PREEMPTION_ENABLED:
+        return
+    delay = delay_s if delay_s is not None else HEAVY_RAM_COALESCE_SECONDS
+    existing = restart_tasks.get(name)
+    if existing and not existing.done():
+        existing.cancel()
+    task = asyncio.create_task(_delayed_restart(name, delay))
+    restart_tasks[name] = task
+
+
+async def _delayed_restart(name: str, delay_s: int) -> None:
+    """After `delay_s` seconds, run the client's `start_command` and poll
+    `health_check` until it responds or `startup_seconds` elapses.
+
+    On start_command / health-check failure, retries with exponential backoff
+    (10/30/90/300 s) for up to 1 h total before giving up and marking
+    `preempted_state[name] = "start_failed"`. Cancellation at any point (via
+    `schedule_restart` coalesce) exits cleanly without touching state.
+    """
+    try:
+        await asyncio.sleep(delay_s)
+    except asyncio.CancelledError:
+        return
+
+    backoffs = [10, 30, 90, 300]  # seconds between retries; roughly a 1 h budget
+    deadline = time.time() + 3600  # 1 hour total
+    attempt = 0
+
+    while time.time() < deadline:
+        config = load_config()
+        cfg = config.get("clients", {}).get(name, {})
+        start_cmd = cfg.get("start_command")
+        health = cfg.get("health_check")
+        startup_seconds = int(cfg.get("startup_seconds", 180))
+
+        if not start_cmd:
+            _log_preemption(
+                action="start_failed",
+                client=name,
+                reason="no start_command in current config",
+                lease_id="",
+            )
+            preempted_state[name] = "start_failed"
+            preempted_since[name] = time.time()
+            restart_tasks.pop(name, None)
+            return
+
+        _log_preemption(
+            action="restart_started",
+            client=name,
+            reason=start_cmd[:120],
+            lease_id="",
+        )
+        try:
+            rc, _out, err = await _run_shell(start_cmd, timeout=60.0)
+            if rc != 0:
+                raise RuntimeError(f"start_command rc={rc}: {err[:160]}")
+
+            # Poll health until up or startup_seconds elapsed.
+            health_start = time.time()
+            hdeadline = health_start + startup_seconds
+            while time.time() < hdeadline:
+                if health and await _check_health(health):
+                    _log_preemption(
+                        action="restart_ok",
+                        client=name,
+                        reason=f"healthy in {int(time.time() - health_start)}s",
+                        lease_id="",
+                    )
+                    preempted_state.pop(name, None)
+                    preempted_since.pop(name, None)
+                    restart_tasks.pop(name, None)
+                    return
+                await asyncio.sleep(2)
+
+            raise RuntimeError(f"health_check timeout after {startup_seconds}s")
+        except asyncio.CancelledError:
+            # Somebody re-scheduled us; just exit without touching state.
+            return
+        except Exception as e:  # noqa: BLE001 — best-effort restart
+            _log_preemption(
+                action="restart_failed",
+                client=name,
+                reason=str(e)[:160],
+                lease_id="",
+            )
+            if attempt < len(backoffs):
+                wait = backoffs[attempt]
+                attempt += 1
+                try:
+                    await asyncio.sleep(wait)
+                except asyncio.CancelledError:
+                    return
+            else:
+                break
+
+    # Out of retries within the 1 h budget — mark start_failed and give up.
+    _log_preemption(
+        action="start_failed",
+        client=name,
+        reason="exhausted 1h retry budget",
+        lease_id="",
+    )
+    preempted_state[name] = "start_failed"
+    preempted_since[name] = time.time()
+    restart_tasks.pop(name, None)
 
 
 # ---------------------------------------------------------------------------
