@@ -46,6 +46,7 @@ Public (bound `0.0.0.0:9090`):
 | POST   | `/service/ensure/{name}?model=...` | acquire + start in one call |
 | GET    | `/clients/{name}/state` | returns `running | paused | stopped | starting` (checks the pause ledger, then `docker inspect`, then health check) |
 | GET    | `/preemption_log?limit=50` | audit trail of pause/unpause/fail events (last 500 kept in memory) |
+| POST   | `/lifecycle/{source}` | accept a Tier-3 lifecycle event from a registered client, fan out to peers (**NEW**) |
 
 Loopback-only admin (rejects non-`127.0.0.1` / `::1` with 403):
 
@@ -53,6 +54,8 @@ Loopback-only admin (rejects non-`127.0.0.1` / `::1` with 403):
 | ------ | ---- | ------- |
 | POST   | `/clients/{name}/pause`   | direct pause regardless of lease state |
 | POST   | `/clients/{name}/unpause` | direct unpause regardless of ledger state |
+| GET    | `/lifecycle_log?limit=50` | audit trail of lifecycle events + per-target delivery outcomes (last 500, **NEW**) |
+| GET    | `/lifecycle/state` | current external-busy map `{source: last_state}` derived from the log (**NEW**) |
 
 ### CPU-contention behaviour
 
@@ -69,6 +72,67 @@ anything stricter than `idle`):
 
 On manager startup, every `cpu_contention` client is unpaused defensively
 (best-effort) to recover from any prior crash that stranded containers paused.
+
+### Lifecycle callback protocol (Tier 3)
+
+A richer, source-first signalling layer sits on top of the Tier-2 pause ledger.
+Clients `POST` their current lifecycle transition to the manager; the manager
+routes it to every OTHER registered peer. Protocol spec + envelope schema
+live in the producer repo at
+[`davemooney/avatar/doc/design/gpu-lifecycle-protocol.md`](https://github.com/davemooney/avatar/blob/main/doc/design/gpu-lifecycle-protocol.md).
+
+#### Envelope
+
+```json
+{
+  "source": "forma-avatar",
+  "state": "generating",
+  "version": 1,
+  "timestamp": "2026-04-20T12:34:56.789Z",
+  "context": {
+    "session_id": "abc123",
+    "estimated_duration_seconds": 90,
+    "pipeline_mode": "lora",
+    "matrix": false
+  }
+}
+```
+
+Valid `state` values: `idle`, `preflight`, `generating`, `cooldown`.
+
+#### `POST /lifecycle/<source>` behaviour
+
+1. **Validation.** 404 if `<source>` isn't in `clients.yaml`. 400 if `version != 1`.
+   422 if `state` isn't one of the four valid transitions.
+2. **Fan-out.** The router concurrently (`asyncio.gather`) POSTs the identical
+   envelope to every OTHER registered client with a `callback_url`. Each
+   per-target POST has a 1-second timeout. Failures are logged (WARN) and
+   counted in the lifecycle_log entry; **no retry — delivery is best-effort,
+   at-most-once**. One slow target cannot delay delivery to other targets.
+3. **Legacy fallback.** For clients WITHOUT a `callback_url` but WITH
+   `preemptible: true` AND `cpu_contention: true`, the router translates:
+   - `state == "generating"` → register a synthetic blocker keyed
+     `lifecycle:<source>` in the `paused_by` ledger and issue `pause_command`
+     (ref-counted against any real leases that also hold the client).
+   - `state == "cooldown"` → release the synthetic blocker; unpause only if
+     the ref-count drops to zero.
+   - `state == "idle" | "preflight"` → no-op.
+4. **Audit.** Every event is recorded in the in-memory `lifecycle_log` deque
+   (500 entries), including the list of targets and each target's delivery
+   outcome (`ok` / `timeout` / `http_error` / `error`).
+
+Once a client implements its own callback endpoint and registers a
+`callback_url`, it bypasses the legacy fallback entirely and handles the
+envelope itself — Tier 2 is strictly the opt-out path.
+
+#### Ref-counting across real leases AND lifecycle signals
+
+The `paused_by` ledger uses string keys. Real leases are keyed by UUID
+(e.g. `lease-abc123`); lifecycle-driven blockers are keyed
+`lifecycle:<source>` (e.g. `lifecycle:forma-avatar`). Both kinds of blocker
+flow through the same unpause path in `unpause_for_released_lease`, so a
+client paused by BOTH a normal lease AND a lifecycle `generating` signal
+stays paused until BOTH blockers clear.
 
 ## Deploying on aidin
 
@@ -131,4 +195,4 @@ so nothing real is launched.
 - [`davemooney/avatar#99`](https://github.com/davemooney/avatar/issues/99) —
   this change: register sglang-vision + CPU-contention preemption
 - [`davemooney/avatar#100`](https://github.com/davemooney/avatar/issues/100) —
-  Tier 3 follow-ups (drain timeouts, observability)
+  Tier 3 lifecycle callback protocol (this repo implements the router side)
