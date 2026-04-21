@@ -289,20 +289,23 @@ def test_preemption_log_endpoint(gpu_manager_module):
 
 
 def test_client_state_endpoint_reports_paused_from_ledger(gpu_manager_module):
+    # WP-102-06: endpoint is now loopback-gated + returns a richer shape.
+    # `blocker_leases` replaces the old `source` field.
     mod, _ = gpu_manager_module
     mod.paused_by["lease-xyz"] = {"sglang-vision"}
+    mod.preempted_state["sglang-vision"] = "paused"
 
-    c = TestClient(mod.app)
+    c = TestClient(mod.app, client=("127.0.0.1", 0))
     r = c.get("/clients/sglang-vision/state")
     assert r.status_code == 200
     body = r.json()
     assert body["state"] == "paused"
-    assert body["source"] == "ledger"
+    assert "lease-xyz" in body["blocker_leases"]
 
 
 def test_client_state_unknown_client_404(gpu_manager_module):
     mod, _ = gpu_manager_module
-    c = TestClient(mod.app)
+    c = TestClient(mod.app, client=("127.0.0.1", 0))
     r = c.get("/clients/nonexistent/state")
     assert r.status_code == 404
 
