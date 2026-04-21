@@ -33,6 +33,7 @@ keys of the form `lifecycle:{source}`.
 import os
 import uuid
 import time
+import logging
 import subprocess
 import asyncio
 from collections import deque
@@ -44,6 +45,8 @@ import yaml
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+logger = logging.getLogger("gpu_manager")
 
 app = FastAPI(title="GPU Resource Manager", version="2.1.0")
 app.add_middleware(
@@ -61,6 +64,13 @@ CONFIG_PATH = os.getenv(
     "GPU_MANAGER_CONFIG",
     str(Path(__file__).parent / "clients.yaml"),
 )
+
+# Feature flag for the heavy_ram preemption path (davemooney/avatar#102).
+# Default on; flip to "false" on the systemd unit to instantly roll back to
+# pure-pause semantics without a code change.
+HEAVY_RAM_PREEMPTION_ENABLED = os.environ.get(
+    "HEAVY_RAM_PREEMPTION_ENABLED", "true"
+).strip().lower() == "true"
 
 PRIORITY_ORDER = {"critical": 0, "high": 1, "normal": 2, "idle": 3}
 
@@ -82,7 +92,22 @@ LIFECYCLE_FANOUT_TIMEOUT_SECONDS = 1.0
 
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
-        return yaml.safe_load(f)
+        data = yaml.safe_load(f) or {}
+
+    # Schema validation: a client flagged `heavy_ram: true` MUST have a
+    # `start_command`, otherwise the stop→restart dispatcher would leave it
+    # stuck in the stopped state with no way to recover. Rather than crash the
+    # manager, flag the client as invalid so the preemption path skips it —
+    # the rest of the config still works.
+    for name, cfg in data.get("clients", {}).items():
+        if cfg.get("heavy_ram") and not cfg.get("start_command"):
+            logger.critical(
+                f"[config] client '{name}' has heavy_ram=true but no start_command — "
+                "excluding from cpu_contention preemption to avoid stuck-stopped state"
+            )
+            cfg["_heavy_ram_invalid"] = True  # internal flag, skipped by dispatchers
+
+    return data
 
 
 def _lifecycle_blocker_key(source_client: str) -> str:
@@ -124,6 +149,16 @@ wait_queue: list[dict] = []
 # A client can appear under multiple blockers — the manager unpauses it only
 # when NO blocker remains for that client.
 paused_by: dict[str, set[str]] = {}
+
+# preempted_state tracks what action was taken on each client by the preemption
+# machinery, so the release-time dispatcher knows how to reverse it.
+# Values: "paused" | "stopped" | "restarting" | "start_failed"
+# Keys: client names as they appear in clients.yaml.
+preempted_state: dict[str, str] = {}
+
+# Parallel map recording when the state transitioned. Used by /clients/{name}/state
+# to report `since_seconds`.
+preempted_since: dict[str, float] = {}
 
 # In-memory audit log of preemption actions. Oldest first, newest last.
 preemption_log: deque = deque(maxlen=PREEMPTION_LOG_MAX)
@@ -1382,6 +1417,24 @@ async def admin_unpause(name: str, request: Request):
         raise HTTPException(500, f"unpause failed rc={rc}: {err.strip()[:200]}")
     _log_preemption("admin_unpause", name, "manual loopback request", None)
     return {"client": name, "paused": False}
+
+
+@app.get("/debug/preempted_state")
+async def get_preempted_state(request: Request):
+    """Loopback-only: snapshot of the heavy_ram preemption ledger.
+
+    Exposes the in-memory `preempted_state` + `preempted_since` maps plus the
+    feature flag so operators can confirm whether the heavy_ram path is
+    actively engaged mid-generate. Loopback-guarded because it reveals the
+    internal preemption machinery shape."""
+    client_host = request.client.host if request.client else None
+    if client_host not in ("127.0.0.1", "::1"):
+        raise HTTPException(status_code=403, detail="loopback only")
+    return {
+        "preempted_state": dict(preempted_state),
+        "preempted_since": dict(preempted_since),
+        "heavy_ram_enabled": HEAVY_RAM_PREEMPTION_ENABLED,
+    }
 
 
 @app.get("/preemption_log")
